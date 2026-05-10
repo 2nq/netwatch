@@ -128,6 +128,30 @@ jobs:
           Expand-Archive -Path npcap-sdk.zip -DestinationPath npcap-sdk
           echo "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" >> $env:GITHUB_ENV
 
+      # Build netwatch-sdk's BPF object so the SDK's `include_bytes!` finds
+      # a real artifact. Without this, Linux release tarballs would compile
+      # netwatch with the `ebpf` feature on but `EventSource::new` would
+      # return `BpfObjectMissing` at runtime → silent fallback to lsof.
+      # The patch.crates-io override only affects this job's build; the
+      # publish job has its own checkout and pulls the unpatched SDK from
+      # crates.io for `cargo publish`.
+      - name: Install bpf-linker (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install bpf-linker --locked
+
+      - name: Build netwatch-sdk eBPF object (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          git clone --depth=1 https://github.com/matthart1983/netwatch-sdk.git "${RUNNER_TEMP}/netwatch-sdk"
+          (cd "${RUNNER_TEMP}/netwatch-sdk" && bash scripts/build-ebpf.sh)
+          # Override the crates.io netwatch-sdk with the local copy that has
+          # `target/bpf/netwatch_sdk_ebpf.o` populated. The SDK build.rs picks
+          # up that file and embeds it via `include_bytes!`. Using printf
+          # rather than a heredoc because the workflow YAML's leading-space
+          # indentation breaks <<EOF terminator detection.
+          printf '\n[patch.crates-io]\nnetwatch-sdk = { path = "%s/netwatch-sdk" }\n' \
+            "$RUNNER_TEMP" >> Cargo.toml
+
       - name: Build
         shell: bash
         run: |

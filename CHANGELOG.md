@@ -2,6 +2,14 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.15.6] - 2026-05-10
+
+### Added
+- **Kernel-level Linux process attribution via netwatch-sdk eBPF** — On Linux, netwatch now loads a `tcp_v4_connect` kprobe (via [`netwatch-sdk`](https://crates.io/crates/netwatch-sdk) Phase 1) that captures `(pid, comm, src/dst, dst_port)` for every outbound TCP connect at kernel time. The Connections collector overlays those attributions onto rows from `ss`/`lsof` polling — same shape as the macOS PKTAP integration — which catches sub-2-second flows that polling misses and reports the actual *thread* `comm` rather than the parent binary's name. The Connections header now shows `attribution: ebpf` (green) when the kprobe is loaded or `attribution: lsof — ebpf unavailable: …` (warn) with the specific reason when it fell back; the per-row bullet glyph swaps to `◉` for kernel-attributed rows. Requires `CAP_BPF` + `CAP_PERFMON` (or root) and kernel ≥ 5.10. The Linux release tarballs ship with the BPF object pre-embedded (the release workflow runs the SDK's `scripts/build-ebpf.sh` and builds netwatch against a `[patch.crates-io]` override that picks up the artifact). For `cargo install netwatch-tui` users on Linux, eBPF currently falls back to `BpfObjectMissing` until the SDK starts shipping the BPF object on crates.io directly — a separate piece of work.
+
+### Changed
+- The `ebpf` feature is now on by default. Builds gracefully fall back to lsof/ss attribution when the platform can't load eBPF — non-Linux hosts (returns `UnsupportedPlatform`), missing capabilities, kernel < 5.10, or the BPF object isn't embedded. macOS continues to use PKTAP for its kernel-attribution path; both sources flip `Connection.attribution` so the renderer can flag them uniformly.
+
 ## [0.15.5] - 2026-05-10
 
 ### Added
