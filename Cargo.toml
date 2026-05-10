@@ -48,6 +48,11 @@ serde_json = "1"
 toml = "0.8"
 dirs = "5"
 maxminddb = "0.27"
+# Used for QUIC Initial decryption (RFC 9001): HKDF-Expand-Label, AES-128-GCM
+# AEAD, and AES-128-ECB header protection via `ring::aead::quic`. Already in
+# the tree as a transitive dep of rustls; pinning explicitly so the QUIC
+# crypto can't break under a transitive bump.
+ring = "0.17"
 
 [features]
 default = []

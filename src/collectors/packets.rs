@@ -1537,6 +1537,13 @@ fn parse_tls(data: &[u8]) -> Option<(String, String)> {
     }
 }
 
+/// Wrapper for use from `crate::collectors::quic`. Re-exposes the existing
+/// TLS ClientHello SNI extractor so QUIC can reuse the parser unchanged
+/// rather than duplicating the extension walk.
+pub(crate) fn extract_sni_for_quic(handshake: &[u8]) -> Option<String> {
+    extract_sni(handshake)
+}
+
 fn extract_sni(handshake: &[u8]) -> Option<String> {
     // ClientHello structure:
     // handshake_type(1) + length(3) + client_version(2) + random(32) = 38 bytes
@@ -1794,9 +1801,18 @@ fn parse_quic(data: &[u8]) -> Option<(String, String)> {
         _ => "Unknown",
     };
 
-    // For Initial packets, try to extract SNI from the embedded ClientHello
-    if pkt_type == 0 && data.len() > 7 {
-        let sni = extract_quic_sni(data);
+    // For Initial packets, derive the well-known Initial keys from the DCID
+    // and decrypt the embedded TLS ClientHello to extract the SNI. Falls
+    // back to "—" when decryption fails (server-side Initials, non-v1/v2
+    // versions, truncated captures, or AEAD failures from packet damage).
+    // See `crate::collectors::quic` for the RFC 9001 implementation.
+    let is_initial = match version {
+        0x00000001 => pkt_type == 0,
+        0x6b3343cf => pkt_type == 1, // QUIC v2 reorders type bits (RFC 9369 §3.2)
+        _ => false,
+    };
+    if is_initial && data.len() > 7 {
+        let sni = crate::collectors::quic::try_extract_initial_sni(data);
         let sni_str = sni.as_deref().unwrap_or("—");
         let info = format!("QUIC {} {} SNI: {}", version_str, type_str, sni_str);
         let detail = format!(
@@ -1814,31 +1830,10 @@ fn parse_quic(data: &[u8]) -> Option<(String, String)> {
     Some((info, detail))
 }
 
-fn extract_quic_sni(data: &[u8]) -> Option<String> {
-    // QUIC Initial packets contain a TLS ClientHello in the payload.
-    // The packet structure is complex (variable-length connection IDs,
-    // token, length, packet number, then CRYPTO frame with the ClientHello).
-    // We do a heuristic scan for the TLS ClientHello marker and SNI extension.
-
-    // Look for TLS ClientHello handshake type (0x01) followed by a reasonable length
-    // and client_version 0x0303 (TLS 1.2, used in QUIC's TLS 1.3 ClientHello)
-    for i in 0..data.len().saturating_sub(50) {
-        if data[i] == 0x01 // handshake type: ClientHello
-            && i + 4 < data.len()
-        {
-            let len = u32::from_be_bytes([0, data[i + 1], data[i + 2], data[i + 3]]) as usize;
-            if len > 30 && len < 10000 && i + 4 + 2 <= data.len() {
-                let ver_major = data[i + 4];
-                let ver_minor = data[i + 5];
-                if ver_major == 3 && ver_minor == 3 {
-                    // Found a likely ClientHello, try to extract SNI
-                    return extract_sni(&data[i..]);
-                }
-            }
-        }
-    }
-    None
-}
+// QUIC SNI extraction now lives in `crate::collectors::quic` (RFC 9001
+// HKDF + AEAD path). The previous heuristic that scanned the encrypted
+// payload for a cleartext ClientHello pattern has been removed — it
+// effectively never fired on real-world QUIC traffic.
 
 // ── Build packet ────────────────────────────────────────────
 
