@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.15.8] - 2026-05-10
+
+### Fixed
+- **Linux release tarballs now ship with the eBPF BPF object embedded** — the v0.15.6 attempt failed because netwatch-sdk's `crates/ebpf-programs/rust-toolchain.toml` listed `bpfel-unknown-none` as a target, making rustup try to download `rust-std` for a tier-3 target that has no precompiled artifact. SDK fix landed at netwatch-sdk@48f8960; netwatch's release workflow re-enables the BPF build step (clone SDK, install bpf-linker, run `scripts/build-ebpf.sh`, then `[patch.crates-io]`-override the SDK so cargo build picks up the local copy with the BPF object embedded). Linux users downloading the tarball or installing via Homebrew now get kernel-attributed PIDs out of the box; `cargo install netwatch-tui` users still fall back to lsof until the SDK starts shipping the pre-built `.o` on crates.io directly.
+
 ## [0.15.7] - 2026-05-10
 
 ### Fixed
