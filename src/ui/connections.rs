@@ -1,4 +1,4 @@
-use crate::app::{App, ConnectionGroup, ConnectionStateFilter, PktapStatus};
+use crate::app::{App, AttributionStatus, ConnectionGroup, ConnectionStateFilter};
 use crate::collectors::connections::AttributionSource;
 use crate::collectors::connections::Connection;
 use crate::collectors::traceroute::TracerouteStatus;
@@ -191,25 +191,26 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // PKTAP attribution status (macOS only). Tells users whether the rows
-    // they see are kernel-attributed (`pktap`) or polled (`lsof`), and why
-    // pktap fell back if it did. Skipped entirely on non-macOS so Linux
-    // and Windows headers stay uncluttered.
-    match app.pktap_status() {
-        PktapStatus::NotApplicable => {}
-        PktapStatus::Active => {
+    // Kernel-attribution status. Picks PKTAP on macOS and eBPF on
+    // Linux+ebpf-feature builds; on platforms with neither the row stays
+    // uncluttered. The source name in the message ("pktap" / "ebpf") is
+    // carried by AttributionStatus so the renderer doesn't have to know
+    // which path won.
+    match app.attribution_status() {
+        AttributionStatus::Lsof => {}
+        AttributionStatus::Active(source) => {
             extra.push(Span::raw("  "));
             extra.push(Span::styled(
-                "attribution: pktap",
+                format!("attribution: {source}"),
                 Style::default().fg(app.theme.status_good),
             ));
         }
-        PktapStatus::Failed(err) => {
+        AttributionStatus::Failed(source, err) => {
             extra.push(Span::raw("  "));
             // Truncate the error so it doesn't blow out narrow terminals.
             let short = err.chars().take(60).collect::<String>();
             extra.push(Span::styled(
-                format!("attribution: lsof — pktap unavailable: {short}"),
+                format!("attribution: lsof — {source} unavailable: {short}"),
                 Style::default().fg(app.theme.status_warn),
             ));
         }
@@ -467,12 +468,16 @@ fn render_conn_row(
     let age_str = connection_age(app, conn);
 
     // Bullet glyph encodes attribution source: `◉` (filled+ring) for
-    // kernel-attributed rows, plain `●` for lsof-polled rows. The header
-    // labels which path is active so users can decode this; see
-    // `render_header`. Selected row uses the same arrow regardless.
+    // kernel-attributed rows (PKTAP on macOS, eBPF on Linux), plain `●`
+    // for lsof-polled rows. The header labels which path is active so
+    // users can decode this; see `render_header`. Selected row uses the
+    // same arrow regardless.
     let bullet = if is_selected {
         "▸ "
-    } else if conn.attribution == AttributionSource::Pktap {
+    } else if matches!(
+        conn.attribution,
+        AttributionSource::Pktap | AttributionSource::Ebpf
+    ) {
         "◉ "
     } else {
         "● "

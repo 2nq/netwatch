@@ -11,16 +11,18 @@ use std::time::Instant;
 
 /// Where the (pid, process_name) on a Connection came from.
 ///
-/// `Lsof` is the userspace fallback (lsof/ss/netstat polling). `Pktap` means
-/// the attribution came from the macOS PKTAP kernel-level capture path —
-/// faster, accurate for short-lived flows, and not subject to poll-interval
-/// blind spots.
+/// `Lsof` is the userspace fallback (lsof/ss/netstat polling). `Pktap`
+/// means the attribution came from the macOS PKTAP kernel-level capture
+/// path. `Ebpf` means it came from netwatch-sdk's tcp_v4_connect kprobe
+/// on Linux. Both kernel paths catch short-lived flows that lsof misses
+/// and report the *thread* comm rather than the parent binary's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AttributionSource {
     #[default]
     Lsof,
     Pktap,
+    Ebpf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +162,8 @@ pub struct ConnectionCollector {
     rate_state: Arc<Mutex<RateState>>,
     #[cfg(target_os = "macos")]
     pktap: Option<Arc<PktapAttributor>>,
+    #[cfg(feature = "ebpf")]
+    ebpf: Option<Arc<crate::ebpf::conn_tracker::EbpfAttributor>>,
 }
 
 impl ConnectionCollector {
@@ -171,6 +175,8 @@ impl ConnectionCollector {
             rate_state: Arc::new(Mutex::new(RateState::new())),
             #[cfg(target_os = "macos")]
             pktap: None,
+            #[cfg(feature = "ebpf")]
+            ebpf: None,
         }
     }
 
@@ -180,6 +186,16 @@ impl ConnectionCollector {
     #[cfg(target_os = "macos")]
     pub fn with_pktap(mut self, pktap: Arc<PktapAttributor>) -> Self {
         self.pktap = Some(pktap);
+        self
+    }
+
+    /// Attach the eBPF attribution cache (Linux). When set, `update()` will
+    /// overlay (pid, comm) from the SDK's `tcp_v4_connect` kprobe onto
+    /// matching ss/lsof-discovered connections — same shape as the PKTAP
+    /// overlay on macOS.
+    #[cfg(feature = "ebpf")]
+    pub fn with_ebpf(mut self, ebpf: Arc<crate::ebpf::conn_tracker::EbpfAttributor>) -> Self {
+        self.ebpf = Some(ebpf);
         self
     }
 
@@ -194,6 +210,8 @@ impl ConnectionCollector {
         let rate_state = Arc::clone(&self.rate_state);
         #[cfg(target_os = "macos")]
         let pktap = self.pktap.clone();
+        #[cfg(feature = "ebpf")]
+        let ebpf = self.ebpf.clone();
         thread::spawn(move || {
             #[cfg(target_os = "macos")]
             let mut result = parse_lsof();
@@ -222,6 +240,11 @@ impl ConnectionCollector {
                 overlay_pktap_attribution(&mut result, pktap);
             }
 
+            #[cfg(feature = "ebpf")]
+            if let Some(ebpf) = ebpf.as_ref() {
+                overlay_ebpf_attribution(&mut result, ebpf);
+            }
+
             *connections.lock().unwrap() = result;
             busy.store(false, Ordering::SeqCst);
         });
@@ -243,6 +266,55 @@ fn overlay_pktap_attribution(connections: &mut [Connection], pktap: &PktapAttrib
             }
         }
     }
+}
+
+/// Overlay (pid, comm) from netwatch-sdk's `tcp_v4_connect` kprobe onto
+/// matching connections. Cache key is `(saddr, daddr, dport)` — sport is 0
+/// in SDK Phase 1 events, so we ignore it here too. Only IPv4 TCP rows are
+/// candidates; everything else is left untouched.
+#[cfg(feature = "ebpf")]
+fn overlay_ebpf_attribution(
+    connections: &mut [Connection],
+    ebpf: &crate::ebpf::conn_tracker::EbpfAttributor,
+) {
+    use std::net::Ipv4Addr;
+
+    for conn in connections {
+        if !conn.protocol.eq_ignore_ascii_case("tcp") {
+            continue;
+        }
+        let (Some(saddr), _) = parse_ipv4_endpoint(&conn.local_addr) else {
+            continue;
+        };
+        let (Some(daddr), Some(dport)) = parse_ipv4_endpoint(&conn.remote_addr) else {
+            continue;
+        };
+        if let Some(attr) = ebpf.lookup(saddr, daddr, dport) {
+            conn.pid = Some(attr.pid);
+            conn.process_name = Some(attr.comm);
+            conn.attribution = AttributionSource::Ebpf;
+        }
+        // `Ipv4Addr` is unused if we early-return on every iter; this
+        // tiny use silences the import-unused warning when iter is empty.
+        let _ = Ipv4Addr::UNSPECIFIED;
+    }
+}
+
+/// Parse `"1.2.3.4:5678"` (or bracketed IPv6, which we reject by returning
+/// None) into `(Ipv4Addr, port)`. Either component may be `None` if the
+/// underlying string was missing it (LISTEN sockets often have remote = "*:*").
+#[cfg(feature = "ebpf")]
+fn parse_ipv4_endpoint(addr: &str) -> (Option<std::net::Ipv4Addr>, Option<u16>) {
+    if addr.starts_with('[') || addr.contains("::") {
+        return (None, None);
+    }
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => (addr, ""),
+    };
+    let ip = host.parse::<std::net::Ipv4Addr>().ok();
+    let port = port.parse::<u16>().ok();
+    (ip, port)
 }
 
 const MAX_TRACKED_CONNECTIONS: usize = 2000;

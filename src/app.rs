@@ -359,8 +359,22 @@ pub struct App {
     pub ebpf_status: EbpfStatus,
     #[allow(dead_code)]
     pub rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor,
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    /// Linux-only kernel attribution path. Holds the SDK's `EventSource`
+    /// (loaded BPF program + reader thread) and an `EbpfAttributor` cache
+    /// the connection collector overlays onto lsof/ss-derived rows. None
+    /// when the SDK couldn't open the BPF object (non-Linux, no CAP_BPF,
+    /// missing pre-built BPF artifact, etc.); the failure reason is
+    /// preserved in `ebpf_init_error` for UI display.
+    #[cfg(feature = "ebpf")]
     pub conn_tracker: Option<crate::ebpf::conn_tracker::ConnTracker>,
+    /// Stringified `EbpfError` from the failed `ConnTracker::new()` call,
+    /// surfaced by `attribution_status()` so the Connections header can
+    /// tell users why eBPF fell back to lsof. Read only by the
+    /// non-macOS branch of `attribution_status()`; on macOS PKTAP wins
+    /// and this stays unread, hence the lint allowance.
+    #[cfg(feature = "ebpf")]
+    #[allow(dead_code)]
+    ebpf_init_error: Option<String>,
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
@@ -419,6 +433,22 @@ pub enum PktapStatus {
     Failed(String),
 }
 
+/// Unified kernel-attribution status for the Connections header. Picks
+/// PKTAP on macOS and eBPF on Linux+ebpf so the renderer doesn't need
+/// platform-specific branches; the strings carry the source name so the
+/// header can say `attribution: pktap` vs `attribution: ebpf` without
+/// hard-coding them.
+#[derive(Debug, Clone)]
+pub enum AttributionStatus {
+    /// No kernel attribution path configured — lsof/ss is the only source.
+    Lsof,
+    /// Kernel attribution active. Carries the source name, e.g. "pktap".
+    Active(&'static str),
+    /// Kernel attribution attempted but failed at startup. First field is
+    /// the source name, second the failure reason.
+    Failed(&'static str, String),
+}
+
 impl App {
     fn new() -> Self {
         let user_config = NetwatchConfig::load();
@@ -472,17 +502,33 @@ impl App {
             Some(handle)
         };
 
-        #[cfg(target_os = "macos")]
-        let connection_collector = {
-            let cc = ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));
-            match pktap_handle.as_ref() {
-                Some(h) => cc.with_pktap(Arc::clone(&h.attributor)),
-                None => cc,
-            }
-        };
-        #[cfg(not(target_os = "macos"))]
-        let connection_collector =
+        // Load netwatch-sdk's tcp_v4_connect kprobe. Same fallback pattern
+        // as PKTAP: if the SDK can't load the BPF object (missing CAP_BPF,
+        // no embedded object, non-Linux host running an ebpf-enabled
+        // build), conn_tracker stays None and the connection collector
+        // continues with lsof/ss attribution only. The failure reason is
+        // captured for UI display.
+        #[cfg(feature = "ebpf")]
+        let (conn_tracker_opt, ebpf_init_error) =
+            match crate::ebpf::conn_tracker::ConnTracker::new() {
+                Ok(t) => (Some(t), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+
+        let mut connection_collector =
             ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(h) = pktap_handle.as_ref() {
+                connection_collector = connection_collector.with_pktap(Arc::clone(&h.attributor));
+            }
+        }
+        #[cfg(feature = "ebpf")]
+        {
+            if let Some(t) = conn_tracker_opt.as_ref() {
+                connection_collector = connection_collector.with_ebpf(Arc::clone(&t.attributor));
+            }
+        }
 
         Self {
             traffic: TrafficCollector::new(),
@@ -531,8 +577,10 @@ impl App {
             intel_last_pkt_id: 0,
             ebpf_status: Self::init_ebpf_status(),
             rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor::new(),
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
-            conn_tracker: crate::ebpf::conn_tracker::ConnTracker::new().ok(),
+            #[cfg(feature = "ebpf")]
+            conn_tracker: conn_tracker_opt,
+            #[cfg(feature = "ebpf")]
+            ebpf_init_error,
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
@@ -580,6 +628,35 @@ impl App {
         PktapStatus::NotApplicable
     }
 
+    /// Unified kernel-attribution status for the Connections header. Returns
+    /// the PKTAP status on macOS, the eBPF status on Linux+ebpf, or
+    /// `NotApplicable` everywhere else. The renderer can branch on this
+    /// once instead of cfg-gating call sites.
+    pub fn attribution_status(&self) -> AttributionStatus {
+        #[cfg(target_os = "macos")]
+        {
+            return match self.pktap_status() {
+                PktapStatus::NotApplicable => AttributionStatus::Lsof,
+                PktapStatus::Active => AttributionStatus::Active("pktap"),
+                PktapStatus::Failed(e) => AttributionStatus::Failed("pktap", e),
+            };
+        }
+        #[cfg(all(not(target_os = "macos"), feature = "ebpf"))]
+        {
+            return match (self.conn_tracker.as_ref(), self.ebpf_init_error.as_ref()) {
+                (Some(_), _) => AttributionStatus::Active("ebpf"),
+                (None, Some(err)) => AttributionStatus::Failed("ebpf", err.clone()),
+                // Defensive: if neither tracker nor error are present
+                // something's wrong with init logic — surface that.
+                (None, None) => AttributionStatus::Failed("ebpf", "init never attempted".into()),
+            };
+        }
+        #[cfg(all(not(target_os = "macos"), not(feature = "ebpf")))]
+        {
+            AttributionStatus::Lsof
+        }
+    }
+
     pub fn sort_column_index(&self, tab: Tab) -> Option<usize> {
         self.sort_states.get(&tab).map(|s| s.column)
     }
@@ -601,14 +678,14 @@ impl App {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(feature = "ebpf")]
     fn init_ebpf_status() -> EbpfStatus {
-        // Status determined after conn_tracker initialization attempt.
-        // Updated in new() based on conn_tracker.is_some().
+        // Initial placeholder. The real status is read live via
+        // `App::ebpf_status()` based on whether `conn_tracker` is Some.
         EbpfStatus::Active
     }
 
-    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    #[cfg(not(feature = "ebpf"))]
     fn init_ebpf_status() -> EbpfStatus {
         EbpfStatus::NotCompiled
     }
@@ -814,25 +891,10 @@ impl App {
             update_top_proc_rx_history(&mut self.top_proc_rx_history, &conns);
         }
 
-        // Drain eBPF connection events and update RTT monitor
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
-        if let Some(ref tracker) = self.conn_tracker {
-            let events = tracker.drain_events();
-            if !events.is_empty() {
-                let samples: Vec<crate::ebpf::rtt_monitor::RttSample> = events
-                    .iter()
-                    .filter_map(|_evt| {
-                        // Only process state_change events with RTT info
-                        // In a full implementation, RTT comes from tcp_probe,
-                        // not conn events. This is a placeholder for the wiring.
-                        None
-                    })
-                    .collect();
-                if !samples.is_empty() {
-                    self.rtt_monitor.process_samples(&samples);
-                }
-            }
-        }
+        // The eBPF event source (when present) drains its own ring buffer
+        // into `conn_tracker.attributor` from a background thread — no
+        // per-tick work needed here. ConnectionCollector consults that
+        // attributor on each refresh via `overlay_ebpf_attribution`.
 
         // Feed network intelligence from new packets
         self.feed_network_intel();

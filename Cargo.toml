@@ -53,15 +53,22 @@ maxminddb = "0.27"
 # the tree as a transitive dep of rustls; pinning explicitly so the QUIC
 # crypto can't break under a transitive bump.
 ring = "0.17"
+# Default: pulls in netwatch-sdk's Phase 1 BPF event source (a kprobe on
+# `tcp_v4_connect` emitting per-(pid, comm, 5-tuple) connect events into
+# a ring buffer for userspace). The SDK gates aya behind its own Linux
+# target deps so this builds clean on macOS/Windows; the runtime path
+# returns `EbpfError::UnsupportedPlatform` and we fall back to lsof/ss
+# attribution. The Linux runtime path also gracefully falls back when
+# the BPF object is missing or CAP_BPF/CAP_PERFMON aren't granted.
+netwatch-sdk = { version = "0.1.1", features = ["ebpf"], optional = true }
 
 [features]
-default = []
-ebpf = ["aya", "aya-log", "bytes"]
+# eBPF process attribution is on by default. The runtime gracefully
+# downgrades to lsof/ss if the kernel won't load the BPF object (no
+# CAP_BPF, kernel <5.10, non-Linux, BPF object not embedded into the
+# SDK build), so users always get *some* attribution.
+default = ["ebpf"]
+ebpf = ["dep:netwatch-sdk"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["net", "ioctl", "hostname"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-aya = { version = "0.12", optional = true }
-aya-log = { version = "0.2", optional = true }
-bytes = { version = "1", optional = true }

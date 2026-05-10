@@ -5,18 +5,20 @@
 //!
 //! When not compiled, stubs are provided so the rest of the app works unchanged.
 
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[cfg(feature = "ebpf")]
 pub mod conn_tracker;
 pub mod rtt_monitor;
 
-/// Status of the eBPF subsystem, used by UI for status bar indicator.
+/// Status of the eBPF subsystem, used by the UI status indicator.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum EbpfStatus {
-    /// eBPF is active and collecting data.
+    /// eBPF is loaded and the kprobe is firing into the attribution cache.
     Active,
-    /// eBPF failed to initialise; includes reason.
+    /// eBPF compiled in, but `EventSource::new()` failed at runtime
+    /// (UnsupportedPlatform on non-Linux, missing CAP_BPF/CAP_PERFMON,
+    /// kernel rejected the program, BPF object not embedded, …).
     Unavailable(String),
-    /// eBPF feature was not compiled in.
+    /// `--features ebpf` wasn't enabled at build time.
     NotCompiled,
 }
