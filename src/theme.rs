@@ -331,7 +331,7 @@ pub fn paper() -> Theme {
     // compressed into the AAA range — column headers and menu-helper
     // body text use `text_muted`, and 5.7:1 still reads pale on white;
     // bumped so every text tier is clearly dark text on a light bg.
-    //   text_primary   #1e1e1e  ≈ 14.5:1  AAA
+    //   text_primary   #0d0d0d  ≈ 17.8:1  AAA  (was #1e1e1e ≈ 14.5:1)
     //   text_secondary #303030  ≈ 11.7:1  AAA  (was #404040 ≈ 9.3:1)
     //   text_muted     #4a4a4a  ≈ 7.6:1   AAA  (was #5a5a5a ≈ 5.7:1)
     //   inactive_tab   #4a4a52  ≈ 7.4:1   AAA  (was #5a5a64 ≈ 5.6:1)
@@ -351,7 +351,7 @@ pub fn paper() -> Theme {
         inactive_tab: Color::Rgb(0x4a, 0x4a, 0x52),
         border: Color::Rgb(160, 160, 160),
         separator: Color::Rgb(160, 160, 160),
-        text_primary: Color::Rgb(30, 30, 30),
+        text_primary: Color::Rgb(0x0d, 0x0d, 0x0d),
         text_secondary: Color::Rgb(0x30, 0x30, 0x30),
         text_muted: Color::Rgb(0x4a, 0x4a, 0x4a),
         text_inverse: Color::Rgb(255, 255, 255),
