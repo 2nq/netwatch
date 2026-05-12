@@ -2,6 +2,20 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.15.10] - 2026-05-13
+
+### Added
+- **Per-process bandwidth uses real per-connection rates** — Previously the Stats "TOP PROCESSES by RX" panel and the Processes tab split total interface bytes proportionally to each process's *connection count*. With most processes holding a single connection this gave every process an identical fictional slice. The collector now aggregates each connection's measured `rx_rate`/`tx_rate` per `(process, pid)` and accumulates cumulative bytes by integrating rate × elapsed across ticks, with stale entries pruned after 5 minutes. The panel only shows real data; processes with no measured traffic report 0 instead of an equal fake share.
+- **`setcap` Linux install path documented** — README now explains the `sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip'` recipe so users can run netwatch without sudo and still get packet capture + eBPF process attribution. Capability table in the README clarifies what each cap unlocks.
+- **mimalloc as the global allocator** — Replaces glibc's `ptmalloc` on Linux (and the system allocator everywhere else). Long-running TUI daemons that spawn short per-tick threads pay a noticeable RSS tax to ptmalloc's per-thread arena retention; mimalloc returns memory to the OS more aggressively and meaningfully reduces the steady-state baseline. Functionally transparent.
+- **Memory-cap diagnostic overlay** — Press `M` to surface every bounded in-memory collection alongside its current fill ratio, so long-running sessions can verify the caps actually hold under load. Diagnostic tool, documented in the help dialog only.
+
+### Fixed
+- **UI no longer flickers between traffic bursts** — Dashboard "ACTIVE INTERFACE" `N live N idle` badge, the Interfaces tab's filter and per-row dot, and the Stats top-processes panel all judged "is this active?" by comparing the current-tick rate to 0. Rates are genuinely 0 most ticks even on busy interfaces, so badges, dots, and counts flapped every refresh. New shared `widgets::interface_recently_active` helper checks the last few history samples instead. Top-processes accumulates bytes across ticks (above) so the panel stays populated through idle moments instead of flashing then emptying.
+- **Stats "TOP PROCESSES by RX" no longer shows 0-byte entries** — Panel was reading `process_bandwidth.ranked()` directly, which is sorted by combined RX+TX rate. A TX-heavy process with no RX traffic could land in the top 5 and render as `<name> — 0 KB`. Re-sorted locally by `rx_bytes` and zero-RX entries filtered out before taking the top 5.
+- **Connections tab: clicking a row now selects that row (#28)** — Mouse hit-test had two bugs: the content-top arithmetic missed the 2-row chip strip and 10-row detail strip, and the new selection was computed as `connection_scroll + visible_row` (relative to the previously-selected row) instead of `window_top + visible_row` (relative to the visible window). Result: clicking the top visible row at scroll>0 didn't change the selection, and clicking deeper rows landed on rows further down than intended, often scrolling the view as the new selection re-centered. Renderer and handler now share `table_inner_area` and `compute_window_top` helpers from `ui::connections`. Reported by @sliddjur.
+- **Clearer error when `traceroute` isn't installed** — Topology's auto-traceroute returned a bare "No such file or directory" on Linux distros that don't include `traceroute` (e.g. Ubuntu default). Now surfaces a distro-aware install hint instead.
+
 ## [0.15.9] - 2026-05-12
 
 ### Changed
