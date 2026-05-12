@@ -62,8 +62,11 @@ pub fn sort(
     });
 }
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
+/// Layout constraints for the Connections tab. Kept as a function so the
+/// renderer and the mouse hit-tester share a single source of truth — when
+/// the chip row or detail strip's height changes, both sides update together.
+fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // header
@@ -72,7 +75,32 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(10), // detail strip
             Constraint::Length(3),  // footer
         ])
-        .split(area);
+        .split(area)
+}
+
+/// Inner table area (inside the bordered block) where data rows are drawn.
+/// Used by `handle_mouse` to map a screen y-coordinate back to a connection
+/// index without duplicating the layout chunk arithmetic.
+pub(crate) fn table_inner_area(area: Rect) -> Rect {
+    let chunks = layout_chunks(area);
+    let outer = chunks[2];
+    let block = Block::default().borders(Borders::ALL);
+    block.inner(outer)
+}
+
+/// Centered-on-selected window top, matching the renderer's auto-scroll
+/// behaviour. Pure function so both sides can compute the same value.
+pub(crate) fn compute_window_top(selected: usize, total: usize, visible_rows: usize) -> usize {
+    if selected < visible_rows {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible_rows / 2)
+        .min(total.saturating_sub(visible_rows))
+}
+
+pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = layout_chunks(area);
 
     render_header(f, app, chunks[0]);
     render_chip_row(f, app, chunks[1]);
@@ -376,14 +404,7 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     let visible_rows = inner.height.saturating_sub(1) as usize;
     let max_idx = conns.len().saturating_sub(1);
     let selected = app.scroll.connection_scroll.min(max_idx);
-    // Auto-scroll: keep selected in view by computing window_top
-    let window_top = if selected < visible_rows {
-        0
-    } else {
-        selected
-            .saturating_sub(visible_rows / 2)
-            .min(conns.len().saturating_sub(visible_rows))
-    };
+    let window_top = compute_window_top(selected, conns.len(), visible_rows);
 
     for (i, conn) in conns.iter().skip(window_top).take(visible_rows).enumerate() {
         let abs_idx = window_top + i;
@@ -1061,6 +1082,37 @@ mod tests {
     use super::*;
     use crate::collectors::connections::Connection;
     use std::collections::VecDeque;
+
+    /// Regression for issue #28 — mouse clicks were using the wrong
+    /// window-top, so `compute_window_top` is the seam we want to lock
+    /// down. The same value drives both the renderer's auto-scroll and
+    /// the mouse hit-tester; if they ever disagree, clicks land on the
+    /// wrong row again.
+    #[test]
+    fn window_top_centers_selection_when_scrolled() {
+        // Selection within the first visible window: don't scroll.
+        assert_eq!(compute_window_top(0, 100, 20), 0);
+        assert_eq!(compute_window_top(5, 100, 20), 0);
+        assert_eq!(compute_window_top(19, 100, 20), 0);
+
+        // Selection past the first window: center it. With visible=20,
+        // selected=30 → window_top = 30 - 10 = 20. The selected row sits
+        // at visible_row=10 (middle of the table).
+        assert_eq!(compute_window_top(30, 100, 20), 20);
+        assert_eq!(compute_window_top(50, 100, 20), 40);
+
+        // Selection near the end: clamp so the last visible row is the
+        // last row of the list (don't scroll past it).
+        assert_eq!(compute_window_top(99, 100, 20), 80);
+        assert_eq!(compute_window_top(95, 100, 20), 80);
+    }
+
+    #[test]
+    fn window_top_handles_short_lists() {
+        // Total shorter than visible window → no scroll.
+        assert_eq!(compute_window_top(0, 5, 20), 0);
+        assert_eq!(compute_window_top(4, 5, 20), 0);
+    }
 
     fn conn(proc: &str, state: &str, remote: &str) -> Connection {
         Connection {
