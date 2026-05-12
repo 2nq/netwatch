@@ -35,6 +35,23 @@ pub const RATE_WIDTH: usize = 8;
 /// Fixed column width for total byte strings (e.g. "999 MB"). Right-aligned.
 pub const TOTAL_WIDTH: usize = 6;
 
+/// Re-paint the theme's panel background over `area` after a popup
+/// uses the `Clear` widget. `Clear` resets each cell to terminal
+/// default — which bypasses the root-level theme background fill in
+/// `app.rs`, so popups on themes that paint a bg (`sky`, `paper`)
+/// would otherwise show the *terminal* background, looking
+/// transparent against the rest of the UI. Themes that leave bg
+/// as `Color::Reset` skip this entirely (no-op).
+///
+/// Takes `&Theme` rather than `&App` so the sort-picker overlay
+/// (which carries `&Theme` for layering reasons) can share the helper.
+pub fn paint_overlay_bg(f: &mut Frame, theme: &crate::theme::Theme, area: Rect) {
+    if theme.bg == ratatui::style::Color::Reset {
+        return;
+    }
+    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
+}
+
 /// Returns true if the interface saw any traffic in the last few history
 /// samples (~5s at 1 Hz). Renderers use this instead of `rx_rate > 0.0`
 /// for "is this interface active" decisions so badges and counts don't

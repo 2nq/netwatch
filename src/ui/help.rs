@@ -13,6 +13,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup = Rect::new(x, y, popup_width, popup_height);
 
     f.render_widget(Clear, popup);
+    crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
 
     let block = Block::default()
         .title(" Help ")

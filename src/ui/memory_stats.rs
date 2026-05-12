@@ -103,6 +103,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup = Rect::new(x, y, popup_w, popup_h);
 
     f.render_widget(Clear, popup);
+    crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
     let block = Block::default()
         .title(" Memory ")
         .borders(Borders::ALL)

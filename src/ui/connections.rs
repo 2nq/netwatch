@@ -883,6 +883,7 @@ fn render_traceroute_overlay(f: &mut Frame, app: &App, area: Rect) {
     let overlay = Rect::new(x, y, overlay_width, overlay_height);
 
     f.render_widget(Clear, overlay);
+    crate::ui::widgets::paint_overlay_bg(f, &app.theme, overlay);
 
     let title = format!(" Traceroute → {} ", result.target);
     let border_color = match result.status {

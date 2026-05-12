@@ -327,11 +327,14 @@ pub fn sky() -> Theme {
 /// the original light theme's `#8c8c8c` greys did not. Use when running
 /// netwatch in a terminal whose own background isn't already off-white.
 pub fn paper() -> Theme {
-    // Contrast budget against the panel bg (#f5f5f2):
+    // Contrast budget against the panel bg (#f5f5f2). Text grays were
+    // compressed into the AAA range — column headers and menu-helper
+    // body text use `text_muted`, and 5.7:1 still reads pale on white;
+    // bumped so every text tier is clearly dark text on a light bg.
     //   text_primary   #1e1e1e  ≈ 14.5:1  AAA
-    //   text_secondary #404040  ≈ 9.3:1   AAA
-    //   text_muted     #5a5a5a  ≈ 5.7:1   AA
-    //   inactive_tab   #5a5a64  ≈ 5.6:1   AA
+    //   text_secondary #303030  ≈ 11.7:1  AAA  (was #404040 ≈ 9.3:1)
+    //   text_muted     #4a4a4a  ≈ 7.6:1   AAA  (was #5a5a5a ≈ 5.7:1)
+    //   inactive_tab   #4a4a52  ≈ 7.4:1   AAA  (was #5a5a64 ≈ 5.6:1)
     //   border         #a0a0a0  ≈ 2.5:1   chrome-only, intentionally faint
     //
     // Data colors were originally inherited from the existing `light`
@@ -345,12 +348,12 @@ pub fn paper() -> Theme {
         name: "paper",
         brand: Color::Rgb(0, 100, 160),
         active_tab: Color::Rgb(0x90, 0x58, 0x00),
-        inactive_tab: Color::Rgb(90, 90, 100),
+        inactive_tab: Color::Rgb(0x4a, 0x4a, 0x52),
         border: Color::Rgb(160, 160, 160),
         separator: Color::Rgb(160, 160, 160),
         text_primary: Color::Rgb(30, 30, 30),
-        text_secondary: Color::Rgb(64, 64, 64),
-        text_muted: Color::Rgb(90, 90, 90),
+        text_secondary: Color::Rgb(0x30, 0x30, 0x30),
+        text_muted: Color::Rgb(0x4a, 0x4a, 0x4a),
         text_inverse: Color::Rgb(255, 255, 255),
         status_good: Color::Rgb(0x00, 0x64, 0x28),
         status_warn: Color::Rgb(0x78, 0x50, 0x00),
