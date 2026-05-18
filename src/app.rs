@@ -1007,7 +1007,7 @@ impl App {
     }
 }
 
-fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
     if addr == "*:*" || addr.is_empty() {
         return (None, None);
     }

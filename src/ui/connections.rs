@@ -824,7 +824,7 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
         .map(|us| format!("{:.1}ms", us / 1000.0))
         .unwrap_or_else(|| "—".into());
 
-    let lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled("FLOW", Style::default().fg(t.text_muted))),
         Line::from(vec![
             Span::styled(
@@ -858,6 +858,38 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
             Span::styled(format!("RTT {}", rtt), Style::default().fg(t.text_primary)),
         ]),
     ];
+
+    // Inline whois output once Shift+W has populated the cache. Mirrors
+    // the rendering in ui/packets.rs so users see something appear after
+    // the lookup — without this the keybinding looks like a no-op.
+    let (remote_ip, _) = crate::app::parse_addr_parts(&conn.remote_addr);
+    if let Some(ip) = remote_ip {
+        if let Some(whois) = app.whois_cache.lookup(&ip) {
+            let mut parts = Vec::new();
+            if !whois.net_name.is_empty() {
+                parts.push(whois.net_name.clone());
+            }
+            if !whois.org.is_empty() {
+                parts.push(whois.org.clone());
+            }
+            if !whois.net_range.is_empty() {
+                parts.push(whois.net_range.clone());
+            }
+            if !whois.country.is_empty() {
+                parts.push(whois.country.clone());
+            }
+            lines.push(Line::from(vec![
+                Span::styled("WHOIS  ", Style::default().fg(t.text_muted)),
+                Span::styled(parts.join(" │ "), Style::default().fg(t.text_primary)),
+            ]));
+            if !whois.description.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("       {}", whois.description),
+                    Style::default().fg(t.text_muted),
+                )));
+            }
+        }
+    }
 
     let body_area = Rect {
         x: area.x + 1,
