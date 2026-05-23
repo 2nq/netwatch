@@ -799,6 +799,32 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
     }
+    let retx_total = stream.retransmits_a_to_b + stream.retransmits_b_to_a;
+    let ooo_total = stream.out_of_order_a_to_b + stream.out_of_order_b_to_a;
+    if retx_total > 0 || ooo_total > 0 {
+        status_spans.push(Span::raw(" │ "));
+        if retx_total > 0 {
+            status_spans.push(Span::styled(
+                format!(
+                    "RETX:{} (↑{} ↓{})",
+                    retx_total, stream.retransmits_a_to_b, stream.retransmits_b_to_a
+                ),
+                Style::default().fg(app.theme.status_error),
+            ));
+        }
+        if ooo_total > 0 {
+            if retx_total > 0 {
+                status_spans.push(Span::raw(" "));
+            }
+            status_spans.push(Span::styled(
+                format!(
+                    "OOO:{} (↑{} ↓{})",
+                    ooo_total, stream.out_of_order_a_to_b, stream.out_of_order_b_to_a
+                ),
+                Style::default().fg(app.theme.status_warn),
+            ));
+        }
+    }
     status_spans.push(Span::raw(format!(" │ Lines: {total_lines} ")));
     let status = Paragraph::new(Line::from(status_spans)).block(
         Block::default()

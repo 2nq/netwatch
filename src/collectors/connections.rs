@@ -50,6 +50,16 @@ pub struct Connection {
     /// matched.
     #[serde(default)]
     pub app_protocol: Option<crate::dpi::AppProtocol>,
+    /// TCP retransmits seen on this flow (sum of both directions). Sourced
+    /// from `StreamTracker::snapshot_anomalies` at update time. Zero on
+    /// non-TCP flows and on TCP flows where no anomaly has been observed.
+    #[serde(default)]
+    pub retransmits: u32,
+    /// TCP segments that arrived behind the per-direction high-water mark
+    /// by less than `OOO_WINDOW_BYTES` — network reorder rather than
+    /// retransmission. Sum of both directions. Zero unless observed.
+    #[serde(default)]
+    pub out_of_order: u32,
 }
 
 /// Which side of a canonical `StreamKey` the connection's local endpoint sits on.
@@ -267,9 +277,13 @@ impl ConnectionCollector {
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let mut result: Vec<Connection> = Vec::new();
 
-            let (stream_bytes, app_protos) = {
+            let (stream_bytes, app_protos, anomalies) = {
                 let tracker = stream_tracker.lock().unwrap();
-                (tracker.snapshot_bytes(), tracker.snapshot_app_protocols())
+                (
+                    tracker.snapshot_bytes(),
+                    tracker.snapshot_app_protocols(),
+                    tracker.snapshot_anomalies(),
+                )
             };
             let mut state = rate_state.lock().unwrap();
             state.tick(stream_bytes, Instant::now());
@@ -281,6 +295,10 @@ impl ConnectionCollector {
                     }
                     if let Some(proto) = app_protos.get(&key) {
                         conn.app_protocol = Some(proto.clone());
+                    }
+                    if let Some(&(retx, ooo)) = anomalies.get(&key) {
+                        conn.retransmits = retx;
+                        conn.out_of_order = ooo;
                     }
                 } else if conn.app_protocol.is_none() {
                     // `lsof` typically reports Chrome's QUIC UDP sockets
@@ -557,6 +575,8 @@ fn parse_lsof() -> Vec<Connection> {
                 tx_rate: None,
                 attribution: AttributionSource::Lsof,
                 app_protocol: None,
+                retransmits: 0,
+                out_of_order: 0,
             });
             *has_network = false;
         }
@@ -682,6 +702,8 @@ fn parse_linux_connections() -> Vec<Connection> {
                 tx_rate: None,
                 attribution: AttributionSource::Lsof,
                 app_protocol: None,
+                retransmits: 0,
+                out_of_order: 0,
             });
         }
     }
@@ -824,6 +846,8 @@ fn parse_windows_connections() -> Vec<Connection> {
             tx_rate: None,
             attribution: AttributionSource::Lsof,
             app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
         })
         .collect()
 }
@@ -898,6 +922,8 @@ mod tests {
             tx_rate: None,
             attribution: AttributionSource::Lsof,
             app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
         }
     }
 

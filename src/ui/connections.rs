@@ -628,10 +628,29 @@ fn render_conn_row(
         ));
     }
 
+    // Build the STATE cell so we can append a retransmit badge inside
+    // its fixed 12-char width when one is present. "↻N" tells operators
+    // at a glance that the flow has TCP retransmits without widening
+    // the row layout. OOO without retransmits gets "↹N" in muted color.
+    let state_cell = if conn.retransmits > 0 {
+        format!("{} ↻{}", truncate(&conn.state, 8), conn.retransmits)
+    } else if conn.out_of_order > 0 {
+        format!("{} ↹{}", truncate(&conn.state, 8), conn.out_of_order)
+    } else {
+        truncate(&conn.state, 12).to_string()
+    };
+    let state_span_color = if conn.retransmits > 0 {
+        t.status_error
+    } else if conn.out_of_order > 0 {
+        t.status_warn
+    } else {
+        state_color
+    };
+
     spans.extend([
         Span::styled(
-            format!(" {:<12}", truncate(&conn.state, 12)),
-            Style::default().fg(state_color),
+            format!(" {:<12}", truncate(&state_cell, 12)),
+            Style::default().fg(state_span_color),
         ),
         Span::styled(format!(" {:>10}", rx_str), Style::default().fg(t.rx_rate)),
         Span::raw(" "),
@@ -1259,6 +1278,8 @@ mod tests {
             tx_rate: None,
             attribution: Default::default(),
             app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
         }
     }
 

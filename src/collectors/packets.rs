@@ -47,6 +47,10 @@ pub struct CapturedPacket {
     pub raw_bytes: Vec<u8>,
     pub stream_index: Option<u32>,
     pub tcp_flags: Option<u8>,
+    /// Sequence number from the TCP header, if this packet is TCP.
+    /// Used for retransmit / out-of-order classification in
+    /// `StreamTracker::track_packet`. `None` for non-TCP packets.
+    pub tcp_seq: Option<u32>,
     pub expert: ExpertSeverity,
     pub timestamp_ns: u64,
     /// L7 protocol classified by `crate::dpi` for this packet's flow,
@@ -332,7 +336,36 @@ pub struct Stream {
     /// Monotonic ns timestamp of the last packet seen on this flow. Drives LRU
     /// eviction when the tracker exceeds MAX_STREAMS.
     last_seen_ns: u64,
+    /// Highest TCP `seq + payload_len` seen in each direction, used to
+    /// classify subsequent segments as retransmits / out-of-order.
+    /// Updated with proper 32-bit wraparound handling (a segment whose
+    /// `seq + len` is "less than" the high-water mark only by a small
+    /// negative diff is treated as behind; a "less than" with a huge
+    /// negative diff is the wraparound case and is treated as ahead).
+    highest_seq_a_to_b: Option<u32>,
+    highest_seq_b_to_a: Option<u32>,
+    /// Count of TCP segments whose seq+len fell entirely behind the
+    /// per-direction high-water mark — bytes the other side has
+    /// effectively already received, being resent. Pure ACKs
+    /// (payload_len == 0) are excluded so duplicate keep-alives don't
+    /// inflate the count.
+    pub retransmits_a_to_b: u32,
+    pub retransmits_b_to_a: u32,
+    /// Count of TCP segments whose seq jumped backwards by a small
+    /// amount (within `OOO_WINDOW_BYTES` of the high-water mark) —
+    /// network reorder rather than retransmission. Reported separately
+    /// so operators can tell "the link is flapping" (high retx) from
+    /// "packets arrive out of order but no resends" (high OOO).
+    pub out_of_order_a_to_b: u32,
+    pub out_of_order_b_to_a: u32,
 }
+
+/// Boundary between "out-of-order" (small reorder window) and "retransmit"
+/// (segment is far behind the high-water mark — the sender is resending
+/// already-received bytes). Wireshark's heuristic is similar; 64 KB is a
+/// conservative choice that covers most reorder cases without
+/// double-counting bursts of retransmits.
+const OOO_WINDOW_BYTES: u32 = 64 * 1024;
 
 pub struct StreamTracker {
     streams: HashMap<StreamKey, u32>,
@@ -390,6 +423,7 @@ impl StreamTracker {
         packet_id: u64,
         timestamp: &str,
         tcp_flags: Option<u8>,
+        tcp_seq: Option<u32>,
         timestamp_ns: u64,
     ) -> u32 {
         let key = StreamKey::new(protocol, src_ip, src_port, dst_ip, dst_port);
@@ -416,6 +450,12 @@ impl StreamTracker {
                     app_protocol: None,
                     app_protocol_attempted: false,
                     quic_crypto_buf: Vec::new(),
+                    highest_seq_a_to_b: None,
+                    highest_seq_b_to_a: None,
+                    retransmits_a_to_b: 0,
+                    retransmits_b_to_a: 0,
+                    out_of_order_a_to_b: 0,
+                    out_of_order_b_to_a: 0,
                 },
             );
             self.evict_if_needed();
@@ -485,6 +525,58 @@ impl StreamTracker {
             stream.total_bytes_a_to_b += payload.len() as u64;
         } else {
             stream.total_bytes_b_to_a += payload.len() as u64;
+        }
+
+        // TCP retransmit / out-of-order detection. Skip pure ACKs
+        // (payload_len == 0) — those are normal, frequent, and would
+        // dominate the count if included. Use 32-bit signed wraparound
+        // arithmetic so flows that exceed 2 GB in a direction (~30 s
+        // at gigabit) are still classified correctly.
+        if protocol == StreamProtocol::Tcp && !payload.is_empty() {
+            if let Some(seq) = tcp_seq {
+                let payload_len = payload.len() as u32;
+                let seq_end = seq.wrapping_add(payload_len);
+
+                let highest = if is_a_to_b {
+                    &mut stream.highest_seq_a_to_b
+                } else {
+                    &mut stream.highest_seq_b_to_a
+                };
+                let (retx, ooo) = if is_a_to_b {
+                    (
+                        &mut stream.retransmits_a_to_b,
+                        &mut stream.out_of_order_a_to_b,
+                    )
+                } else {
+                    (
+                        &mut stream.retransmits_b_to_a,
+                        &mut stream.out_of_order_b_to_a,
+                    )
+                };
+
+                match *highest {
+                    None => *highest = Some(seq_end),
+                    Some(h) => {
+                        // Signed diff is positive iff seq_end is "ahead" of h
+                        // in TCP-sequence-space (handles 32-bit wraparound).
+                        let diff = seq_end.wrapping_sub(h) as i32;
+                        if diff > 0 {
+                            *highest = Some(seq_end);
+                        } else {
+                            // seq_end <= h ⇒ bytes already covered.
+                            // Distinguish OOO from retransmit by how far
+                            // behind we are: small backwards jump = network
+                            // reorder; large = sender resending acked bytes.
+                            let behind = h.wrapping_sub(seq_end);
+                            if behind <= OOO_WINDOW_BYTES {
+                                *ooo = ooo.saturating_add(1);
+                            } else {
+                                *retx = retx.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // DPI classification.
@@ -601,6 +693,25 @@ impl StreamTracker {
         self.all_streams
             .values()
             .map(|s| (s.key.clone(), (s.total_bytes_a_to_b, s.total_bytes_b_to_a)))
+            .collect()
+    }
+
+    /// Snapshot per-stream TCP anomaly counters (retransmits, out-of-order),
+    /// summed across both directions. Used by the connection collector to
+    /// attach a per-row count without holding the tracker lock through the
+    /// connection render path. Values are `(retransmits, out_of_order)`.
+    pub fn snapshot_anomalies(&self) -> HashMap<StreamKey, (u32, u32)> {
+        self.all_streams
+            .values()
+            .filter_map(|s| {
+                let retx = s.retransmits_a_to_b + s.retransmits_b_to_a;
+                let ooo = s.out_of_order_a_to_b + s.out_of_order_b_to_a;
+                if retx == 0 && ooo == 0 {
+                    None
+                } else {
+                    Some((s.key.clone(), (retx, ooo)))
+                }
+            })
             .collect()
     }
 
@@ -789,6 +900,7 @@ impl PacketCollector {
                                         parsed.id,
                                         &parsed.timestamp,
                                         parsed.tcp_flags,
+                                        parsed.tcp_seq,
                                         parsed.timestamp_ns,
                                     );
                                     let ap = t.get_stream(i).and_then(|s| s.app_protocol.clone());
@@ -926,6 +1038,7 @@ fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Optio
                 data,
                 dns,
                 None,
+                None,
             ))
         }
         0x86DD => parse_ipv6_packet(data, &data[14..], &mut details, counter, dns),
@@ -933,9 +1046,19 @@ fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Optio
     }
 }
 
-// Transport parse result: (protocol, src_port, dst_port, info, app_payload_offset, tcp_flags)
-// app_payload_offset is relative to the transport data start
-type TransportResult = (String, Option<u16>, Option<u16>, String, usize, Option<u8>);
+// Transport parse result:
+// (protocol, src_port, dst_port, info, app_payload_offset, tcp_flags, tcp_seq)
+// app_payload_offset is relative to the transport data start. tcp_seq is
+// the TCP sequence number, used for retransmit / OOO classification.
+type TransportResult = (
+    String,
+    Option<u16>,
+    Option<u16>,
+    String,
+    usize,
+    Option<u8>,
+    Option<u32>,
+);
 
 fn parse_ipv4_packet(
     raw: &[u8],
@@ -965,7 +1088,7 @@ fn parse_ipv4_packet(
     ));
 
     let transport_data = if data.len() > ihl { &data[ihl..] } else { &[] };
-    let (protocol, src_port, dst_port, info, payload_off, flags) =
+    let (protocol, src_port, dst_port, info, payload_off, flags, seq) =
         parse_transport(protocol_num, transport_data, &src, &dst, details);
 
     let app_payload = if transport_data.len() > payload_off {
@@ -988,6 +1111,7 @@ fn parse_ipv4_packet(
         raw,
         dns,
         flags,
+        seq,
     ))
 }
 
@@ -1018,7 +1142,7 @@ fn parse_ipv6_packet(
     ));
 
     let transport_data = if data.len() > 40 { &data[40..] } else { &[] };
-    let (protocol, src_port, dst_port, info, payload_off, flags) =
+    let (protocol, src_port, dst_port, info, payload_off, flags, seq) =
         parse_transport(next_header, transport_data, &src, &dst, details);
 
     let app_payload = if transport_data.len() > payload_off {
@@ -1041,6 +1165,7 @@ fn parse_ipv6_packet(
         raw,
         dns,
         flags,
+        seq,
     ))
 }
 
@@ -1056,11 +1181,11 @@ fn parse_transport(
         17 if data.len() >= 8 => parse_udp(data, src_ip, dst_ip, details),
         1 => {
             let r = parse_icmp(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len(), None)
+            (r.0, r.1, r.2, r.3, data.len(), None, None)
         }
         58 => {
             let r = parse_icmpv6(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len(), None)
+            (r.0, r.1, r.2, r.3, data.len(), None, None)
         }
         _ => {
             let name = ip_protocol_name(proto);
@@ -1071,6 +1196,7 @@ fn parse_transport(
                 None,
                 format!("{} → {} {}", src_ip, dst_ip, name),
                 data.len(),
+                None,
                 None,
             )
         }
@@ -1128,6 +1254,7 @@ fn parse_tcp(
                     result.info,
                     data_offset,
                     Some(flags),
+                    Some(seq),
                 );
             }
         }
@@ -1166,6 +1293,7 @@ fn parse_tcp(
         info,
         data_offset,
         Some(flags),
+        Some(seq),
     )
 }
 
@@ -1206,6 +1334,7 @@ fn parse_udp(
                     result.info,
                     8,
                     None,
+                    None,
                 );
             }
         }
@@ -1231,7 +1360,7 @@ fn parse_udp(
     } else {
         "UDP".into()
     };
-    (proto, Some(src_port), Some(dst_port), info, 8, None)
+    (proto, Some(src_port), Some(dst_port), info, 8, None, None)
 }
 
 fn parse_icmp(
@@ -1981,6 +2110,7 @@ fn build_packet(
     raw: &[u8],
     dns: &DnsCache,
     tcp_flags: Option<u8>,
+    tcp_seq: Option<u32>,
 ) -> CapturedPacket {
     let mut cnt = counter.lock().unwrap();
     *cnt += 1;
@@ -2054,6 +2184,7 @@ fn build_packet(
         raw_bytes: raw.to_vec(),
         stream_index: None,
         tcp_flags,
+        tcp_seq,
         expert,
         timestamp_ns,
         app_protocol: None,
@@ -2744,6 +2875,7 @@ mod tests {
             raw_bytes: vec![],
             stream_index: None,
             tcp_flags: None,
+            tcp_seq: None,
             expert: ExpertSeverity::Chat,
             timestamp_ns: 0,
             app_protocol: None,
@@ -3216,6 +3348,7 @@ mod tests {
             1,
             "00:00:00",
             Some(0x02),
+            None,
             1_000_000,
         );
         assert_eq!(idx, 0);
@@ -3236,6 +3369,7 @@ mod tests {
             1,
             "t",
             None,
+            None,
             0,
         );
         let i2 = tracker.track_packet(
@@ -3247,6 +3381,7 @@ mod tests {
             b"",
             2,
             "t",
+            None,
             None,
             0,
         );
@@ -3266,6 +3401,7 @@ mod tests {
             1,
             "t",
             Some(0x02),
+            None,
             1_000_000,
         );
         tracker.track_packet(
@@ -3278,6 +3414,7 @@ mod tests {
             2,
             "t",
             Some(0x12),
+            None,
             2_000_000,
         );
         tracker.track_packet(
@@ -3290,6 +3427,7 @@ mod tests {
             3,
             "t",
             Some(0x10),
+            None,
             3_000_000,
         );
         let hs = tracker.get_stream(0).unwrap().handshake.as_ref().unwrap();
@@ -3309,6 +3447,7 @@ mod tests {
             b"",
             1,
             "t",
+            None,
             None,
             0,
         );
@@ -3336,6 +3475,7 @@ mod tests {
                 i as u64,
                 "t",
                 Some(TCP_FLAG_SYN),
+                None,
                 i as u64, // monotonic timestamp_ns: later i => more recent
             );
         }
@@ -3376,6 +3516,7 @@ mod tests {
             0,
             "t",
             Some(TCP_FLAG_SYN),
+            None,
             1_000_000,
         );
         tracker.track_packet(
@@ -3388,6 +3529,7 @@ mod tests {
             1,
             "t",
             Some(TCP_FLAG_SYN | TCP_FLAG_ACK),
+            None,
             2_000_000,
         );
         let mut sampled = std::collections::HashSet::new();
@@ -3416,6 +3558,7 @@ mod tests {
                 (10 + i) as u64,
                 "t",
                 Some(TCP_FLAG_SYN),
+                None,
                 ts,
             );
         }
@@ -3427,5 +3570,279 @@ mod tests {
         // Visitor must scrub the evicted index from `sampled`.
         tracker.for_each_new_handshake_rtt(&mut sampled, |_, _| {});
         assert!(!sampled.contains(&0), "evicted index leaked in sampled set");
+    }
+
+    fn track_tcp_payload(
+        tracker: &mut StreamTracker,
+        src_ip: &str,
+        src_port: u16,
+        dst_ip: &str,
+        dst_port: u16,
+        seq: u32,
+        payload_len: usize,
+        ts_ns: u64,
+        id: u64,
+    ) -> u32 {
+        let payload = vec![0u8; payload_len];
+        tracker.track_packet(
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            StreamProtocol::Tcp,
+            &payload,
+            id,
+            "t",
+            Some(TCP_FLAG_ACK),
+            Some(seq),
+            ts_ns,
+        )
+    }
+
+    #[test]
+    fn retransmit_counted_for_segment_well_behind_high_water() {
+        // High-water at seq+len = 1_000_000 + 200 = 1_000_200. A retransmit
+        // of bytes near seq=1000 (well over OOO_WINDOW_BYTES behind) should
+        // be classified as retransmit, not OOO.
+        let mut tracker = StreamTracker::new();
+        let idx = track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1_000_000,
+            200,
+            1,
+            1,
+        );
+        // 1_000_200 - 1200 = 999_000 → far beyond OOO_WINDOW_BYTES (65 536).
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            200,
+            2,
+            2,
+        );
+
+        let stream = tracker.get_stream(idx).unwrap();
+        assert_eq!(stream.retransmits_a_to_b, 1);
+        assert_eq!(stream.out_of_order_a_to_b, 0);
+    }
+
+    #[test]
+    fn out_of_order_counted_for_small_backwards_jump() {
+        // High-water at seq+len = 1500. A segment with seq+len = 500 is
+        // 1000 bytes behind — well within OOO_WINDOW_BYTES (65 536), so
+        // it's a network reorder, not a retransmit.
+        let mut tracker = StreamTracker::new();
+        let idx = track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            500,
+            1,
+            1,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            200,
+            300,
+            2,
+            2,
+        );
+
+        let stream = tracker.get_stream(idx).unwrap();
+        assert_eq!(stream.out_of_order_a_to_b, 1);
+        assert_eq!(stream.retransmits_a_to_b, 0);
+    }
+
+    #[test]
+    fn pure_acks_do_not_count_as_retransmits() {
+        // Three packets with payload_len == 0 (pure ACKs). The high-water
+        // mark should never advance, and no retransmits should be counted
+        // even when seqs are equal.
+        let mut tracker = StreamTracker::new();
+        let idx = track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            0,
+            1,
+            1,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            0,
+            2,
+            2,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            0,
+            3,
+            3,
+        );
+
+        let stream = tracker.get_stream(idx).unwrap();
+        assert_eq!(stream.retransmits_a_to_b, 0);
+        assert_eq!(stream.out_of_order_a_to_b, 0);
+    }
+
+    #[test]
+    fn forward_progress_advances_high_water_without_counting_anomalies() {
+        let mut tracker = StreamTracker::new();
+        let idx = track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            200,
+            1,
+            1,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1200,
+            200,
+            2,
+            2,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1400,
+            200,
+            3,
+            3,
+        );
+
+        let stream = tracker.get_stream(idx).unwrap();
+        assert_eq!(stream.retransmits_a_to_b, 0);
+        assert_eq!(stream.out_of_order_a_to_b, 0);
+    }
+
+    #[test]
+    fn retransmits_tracked_per_direction() {
+        let mut tracker = StreamTracker::new();
+        // A→B forward, then A→B retransmit (far behind) → retransmits_a_to_b = 1.
+        let idx = track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1_000_000,
+            200,
+            1,
+            1,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            1000,
+            200,
+            2,
+            2,
+        );
+        // B→A forward (independent direction).
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.2",
+            80,
+            "10.0.0.1",
+            5000,
+            5_000_000,
+            200,
+            3,
+            3,
+        );
+        // B→A retransmit far behind.
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.2",
+            80,
+            "10.0.0.1",
+            5000,
+            1000,
+            200,
+            4,
+            4,
+        );
+
+        let stream = tracker.get_stream(idx).unwrap();
+        assert_eq!(stream.retransmits_a_to_b, 1);
+        assert_eq!(stream.retransmits_b_to_a, 1);
+    }
+
+    #[test]
+    fn seq_wraparound_treated_as_forward_progress() {
+        // High-water near 32-bit max (0xFFFFFE00 + 0x100 = 0xFFFFFF00).
+        // Next segment at seq=0x100, len=0x100 → new high-water 0x200.
+        // The signed diff seq_end - h = 0x200 - 0xFFFFFF00 = +0x300 (mod 2^32),
+        // i.e. ahead in wraparound space. Should NOT count as retransmit/OOO.
+        let mut tracker = StreamTracker::new();
+        let idx = track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            0xFFFFFE00,
+            0x100,
+            1,
+            1,
+        );
+        track_tcp_payload(
+            &mut tracker,
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            80,
+            0x100,
+            0x100,
+            2,
+            2,
+        );
+
+        let stream = tracker.get_stream(idx).unwrap();
+        assert_eq!(stream.retransmits_a_to_b, 0);
+        assert_eq!(stream.out_of_order_a_to_b, 0);
     }
 }

@@ -2,6 +2,24 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.19.0] - 2026-05-23
+
+### Added
+- **TCP retransmit + out-of-order analytics per stream.** Every TCP segment now updates a per-direction high-water sequence number on its flow. Segments whose `seq + payload_len` lands behind that mark are classified by how far behind:
+  - **Retransmit** when the gap exceeds `OOO_WINDOW_BYTES` (64 KB) — the sender is resending bytes the other side has effectively already received.
+  - **Out-of-order** when the gap is smaller — network reorder, not retransmission.
+  Pure ACKs (zero payload) are excluded so duplicate keep-alives don't inflate the count. 32-bit wraparound is handled with signed-diff arithmetic so long sessions (>2 GB per direction) still classify correctly.
+- **Visible per row on the Connections tab.** When a flow has retransmits, the STATE cell renders `ESTAB… ↻N` in the error color; OOO-only flows render `ESTAB… ↹N` in warn color. Operators can scan a busy table and immediately see which flows are unhealthy without drilling into Stream View.
+- **Per-direction breakdown in Stream View** (Enter on a connection → status bar). Shows `RETX:N (↑A ↓B)` and `OOO:N (↑A ↓B)` so the split between sender-side and receiver-side anomalies is visible.
+- Six unit tests in `src/collectors/packets.rs` cover the classification: retransmit-far-behind, OOO-small-jump, pure-ACK-not-counted, forward-progress, per-direction tracking, and 32-bit wraparound.
+
+### Changed
+- `CapturedPacket` gained a `tcp_seq: Option<u32>` field; the transport-result tuple gained the seq element. `StreamTracker::track_packet` takes a `tcp_seq` parameter. The data flows from `parse_tcp` through `parse_transport` → `parse_ipv4_packet` / `parse_ipv6_packet` → `track_packet`.
+- `Connection` struct gained `retransmits: u32` and `out_of_order: u32` fields, sourced from a new `StreamTracker::snapshot_anomalies()` snapshot during the connection collector's update tick. Both default to 0 via `#[serde(default)]` so on-disk Flight Recorder bundles and stored configs remain forward-compatible.
+
+### Notes
+This closes the `TCP retransmits / out-of-order analytics` row on the netwatch-vs-rustnet matrix that's been red since the May snapshots. Combined with the v0.18.x sandbox arc, netwatch's defensible-edge picture vs. rustnet narrows the rustnet column to: DPI long-tail (MQTT/BitTorrent/SNMP/…), smart staleness coloring, Windows+FreeBSD native process attribution, and distribution breadth.
+
 ## [0.18.1] - 2026-05-23
 
 ### Changed

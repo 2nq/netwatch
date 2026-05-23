@@ -527,6 +527,7 @@ mod tests {
             raw_bytes: vec![],
             stream_index: None,
             tcp_flags: None,
+            tcp_seq: None,
             expert,
             timestamp_ns: 0,
             app_protocol: None,
@@ -546,6 +547,8 @@ mod tests {
             tx_rate: None,
             attribution: Default::default(),
             app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
         }
     }
 

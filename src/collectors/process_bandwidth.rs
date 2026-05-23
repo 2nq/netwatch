@@ -284,6 +284,8 @@ mod tests {
             tx_rate: tx,
             attribution: Default::default(),
             app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
         }
     }
 
