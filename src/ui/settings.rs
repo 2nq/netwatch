@@ -147,7 +147,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup_width = (area.width * 60 / 100)
         .max(50)
         .min(area.width.saturating_sub(4));
-    let popup_height = (SETTINGS_COUNT as u16 + 7).min(area.height.saturating_sub(4));
+    // +9 accounts for: 1 blank line, 1 sandbox-info row, 1 blank, 1 status
+    // message row, 1 footer hint row + borders/padding.
+    let popup_height = (SETTINGS_COUNT as u16 + 9).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -213,6 +215,31 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(value_display, value_style),
         ]));
     }
+
+    // Sandbox enforcement state — read-only info row. Surfaces whether
+    // Landlock / cap-drop / Seatbelt actually applied so users can
+    // confirm enforcement at runtime rather than trusting the README.
+    lines.push(Line::raw(""));
+    let sandbox_summary = app.sandbox_report.summary();
+    let sandbox_color = if sandbox_summary == "disabled" {
+        app.theme.text_muted
+    } else if app.sandbox_report.mode.warnings.is_empty()
+        && (app.sandbox_report.platform.landlock_abi > 0
+            || app.sandbox_report.platform.macos_seatbelt
+            || app.sandbox_report.platform.windows_restricted
+            || !app.sandbox_report.platform.caps_dropped.is_empty())
+    {
+        app.theme.status_good
+    } else {
+        app.theme.text_muted
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {:<width$}", "Sandbox", width = label_width + 2),
+            Style::default().fg(app.theme.brand),
+        ),
+        Span::styled(sandbox_summary, Style::default().fg(sandbox_color)),
+    ]));
 
     // Status message
     lines.push(Line::raw(""));

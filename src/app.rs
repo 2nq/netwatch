@@ -448,6 +448,10 @@ pub struct App {
     /// when pktap couldn't be opened (e.g. no root).
     #[cfg(target_os = "macos")]
     pktap_handle: Option<crate::platform::pktap::PktapHandle>,
+    /// Outcome of the post-startup sandbox apply. Populated by
+    /// `app::run` after `App::new` returns and the privileged fds are
+    /// open. Surfaced in the Settings overlay.
+    pub sandbox_report: crate::sandbox::Report,
 }
 
 /// State of the PKTAP attribution path for status display. macOS-only;
@@ -601,6 +605,7 @@ impl App {
             incident_capture_started: false,
             #[cfg(target_os = "macos")]
             pktap_handle,
+            sandbox_report: crate::sandbox::Report::default(),
         }
     }
 
@@ -1055,8 +1060,35 @@ fn build_connection_filter(conn: &Connection) -> String {
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     remote: Option<&crate::remote::RemotePublisher>,
+    sandbox_mode: crate::sandbox::Mode,
 ) -> Result<()> {
     let mut app = App::new();
+
+    // Apply the security sandbox after App::new finishes — pcap handles,
+    // PKTAP attributor, and the eBPF kprobe are all up at this point, so
+    // we can drop the elevated capabilities and restrict filesystem
+    // access. Strict mode surfaces any warnings and aborts startup.
+    {
+        let paths = crate::sandbox::SandboxPaths::from_config(&app.user_config);
+        let report = crate::sandbox::apply(sandbox_mode, &paths);
+        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) && !report.mode.warnings.is_empty()
+        {
+            anyhow::bail!(
+                "sandbox: strict mode could not be enforced: {}",
+                report.mode.warnings.join("; ")
+            );
+        }
+        for w in &report.mode.warnings {
+            tracing::warn!(target: "netwatch::sandbox", "{w}");
+        }
+        tracing::info!(
+            target: "netwatch::sandbox",
+            summary = %report.summary(),
+            "sandbox applied"
+        );
+        app.sandbox_report = report;
+    }
+
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
     let mut events = EventHandler::new(tick_rate);
 

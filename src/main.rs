@@ -32,6 +32,8 @@ async fn main() -> Result<()> {
              OPTIONS:\n    --generate-config         Write a default config file and exit\n    \
              --remote <url>            Stream metrics to a NetWatch Core instance\n    \
              --api-key <key>           API key for remote streaming\n    \
+             --no-sandbox              Disable the post-startup security sandbox\n    \
+             --sandbox-strict          Refuse to start if the sandbox can't be enforced\n    \
              -h, --help                Print help\n    -V, --version             Print version\n\n\
              KEYS (in TUI):\n    1-7   Switch tabs    /     Filter    q   Quit\n    \
              Shift+R/F/E   Flight Recorder: arm / freeze / export",
@@ -58,6 +60,14 @@ async fn main() -> Result<()> {
         .windows(2)
         .find(|w| w[0] == "--api-key")
         .map(|w| w[1].clone());
+
+    let sandbox_mode = if args.iter().any(|a| a == "--no-sandbox") {
+        netwatch::sandbox::Mode::Disabled
+    } else if args.iter().any(|a| a == "--sandbox-strict") {
+        netwatch::sandbox::Mode::Strict
+    } else {
+        netwatch::sandbox::Mode::BestEffort
+    };
 
     let remote_publisher = match (remote_url, api_key) {
         (Some(url), Some(key)) => {
@@ -88,7 +98,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = app::run(&mut terminal, remote_publisher.as_ref()).await;
+    let result = app::run(&mut terminal, remote_publisher.as_ref(), sandbox_mode).await;
 
     disable_raw_mode()?;
     execute!(

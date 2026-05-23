@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.16.2"
+version = "0.17.0"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -94,3 +94,11 @@ ebpf = ["dep:netwatch-sdk"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["net", "ioctl", "hostname"] }
+
+# Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
+# pcap + eBPF are up, then restrict filesystem and network via Landlock.
+# Both crates are Linux-only — the sandbox module's macOS/Windows paths
+# are stubs that report Disabled until Phase 2/3 land.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+caps = "0.5"

@@ -97,6 +97,30 @@ header surfaces the active source (`attribution: ebpf`, `attribution: pktap`,
 or `attribution: lsof — ebpf unavailable: …`) so you can tell at a glance
 which path is live.
 
+### Security sandbox (Linux)
+
+Once pcap and the eBPF kprobe are up, netwatch hands those elevated
+capabilities back and locks itself into a Landlock-enforced filesystem
+allow-list — so a memory-safety bug in DPI parsing can't read SSH keys
+or pivot via a new raw socket. Default is best-effort; production
+deployments that want a hard guarantee should use strict mode.
+
+```bash
+netwatch                     # best-effort sandbox (default)
+netwatch --sandbox-strict    # refuse to start if Landlock can't enforce
+netwatch --no-sandbox        # escape hatch for debugging
+```
+
+What gets restricted:
+
+- **Capabilities dropped post-init**: `CAP_NET_RAW`, `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`. The pcap fd stays open and the kprobe stays attached; the process just can't acquire any *new* raw sockets or load any *new* BPF programs.
+- **Filesystem allow-list** (kernel-enforced, independent of DAC): `/proc`, system resolver files, zoneinfo, CA bundles, the user's `~/.config/netwatch/` and configured GeoIP DB dirs are read-only. `~/.cache/netwatch/` (logs + Flight Recorder bundles), startup CWD (PCAP exports), `/tmp`, and `/run/user/<uid>` are read-write. Everything else `EACCES`.
+- **Live verification**: the Settings overlay shows the enforcement state — `best-effort: Landlock ABI V4, 3 caps dropped` — so you can confirm at runtime that the sandbox actually applied, not just that the binary advertises it.
+
+Network restriction (TCP bind/connect block) is intentionally not enabled — it would silently break the ip-api.com GeoIP fallback, `--remote` streaming, and inline WHOIS. The threat model the sandbox is built for (exploitable DPI parsing of hostile capture traffic on a production host) is well served by filesystem and capability restrictions alone.
+
+macOS and Windows are not on the sandbox roadmap. The threat the sandbox defends against is production-capture-specific, and that audience is overwhelmingly Linux; building Seatbelt or Windows-token wrappers would buy feature-matrix parity with neighbouring tools without buying users meaningful security.
+
 ### Flight Recorder
 
 Catch transient failures that vanish before you can inspect them:

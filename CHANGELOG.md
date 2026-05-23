@@ -2,6 +2,23 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.17.0] - 2026-05-23
+
+### Added
+- **Security sandbox (Linux).** After pcap, PKTAP, and the eBPF kprobe finish setup, netwatch now restricts its own authority so a memory-safety bug in DPI parsing (the largest unsafe surface) cannot read SSH keys, exfiltrate arbitrary files, or pivot via new raw sockets. Two layers, applied in order:
+  - **Capability drop** via the `caps` crate: `CAP_NET_RAW`, `CAP_BPF`, `CAP_PERFMON`, and the legacy `CAP_SYS_ADMIN` BPF fallback are removed from the Effective, Permitted, and Inheritable sets. The kprobe is already attached and the pcap fd is already open; the process never needs those capabilities again. Running without elevation (no `setcap`, no `sudo`) is a clean no-op.
+  - **Landlock filesystem restriction** via the `landlock` crate, targeting ABI V4 with graceful BestEffort degrade to V3 / V2 / V1 on older kernels. The ruleset allows reads from `/proc`, the system resolver files (`/etc/resolv.conf`, `/etc/hosts`, `/etc/services`, `/etc/nsswitch.conf`, …), zoneinfo, CA bundles, NSS-module dirs, the user's `~/.config/netwatch/` and any configured GeoIP DB parent dirs; allows writes only to `~/.cache/netwatch/` (logs + Flight Recorder bundles), the startup CWD (PCAP exports), `/tmp`, and `/run/user/<uid>`. Everything else fails with `EACCES` at the kernel — independent of DAC.
+- **Three enforcement modes**, selectable via CLI:
+  - **default (best-effort)**: apply what the kernel supports; log a single warning if Landlock isn't enforced (e.g., kernel <5.13 or LSM not enabled). Don't refuse to start.
+  - **`--no-sandbox`**: escape hatch for debugging; skips both cap drop and Landlock.
+  - **`--sandbox-strict`**: refuse to start if any platform-supported restriction can't be applied. Intended for production deployments where the operator wants a hard guarantee.
+- **Settings overlay sandbox row** — read-only info line showing the live enforcement state, e.g. `best-effort: Landlock ABI V4, 3 caps dropped`. Users can confirm the sandbox actually applied at runtime rather than trusting the README claim.
+- **`examples/sandbox_smoke.rs`** — a runnable Linux smoke test that applies the sandbox in BestEffort mode and then exercises four real accesses: read `/proc/self/status` (allowed), read `/etc/shadow` (expected EACCES), open a raw socket (expected EPERM), print the enforcement report. Exits non-zero on any unexpected outcome. Used in dev to verify Landlock is actually enforcing.
+
+### Notes
+
+The sandbox is **Linux-only by design**, not Linux-first. macOS Seatbelt and Windows restricted-token are intentionally not on the roadmap. The threat the sandbox defends against — exploitable DPI parsing of hostile traffic — is a production-capture-host concern, not a dev-workstation one. Spending the budget on per-platform sandboxes for feature-matrix parity with neighbouring tools would dilute focus without buying users meaningful security. Landlock network blocking (TCP bind/connect denial on ABI V4) is also deferred: a blanket TCP-block would silently break the ip-api.com GeoIP fallback, `--remote` metric streaming, and inline WHOIS lookups. A future revision can add per-port allow-listing once those endpoints are reachable behind a stable list.
+
 ## [0.16.2] - 2026-05-20
 
 ### Fixed
