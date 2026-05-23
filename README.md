@@ -85,6 +85,13 @@ sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"
 netwatch
 ```
 
+> **Re-run after every install.** `setcap` attaches to a specific binary on
+> disk; `cargo install netwatch-tui` (and the GitHub Release tarballs)
+> overwrite that file, so the capabilities don't carry over. If you see
+> `pcap open failed: socket: Operation not permitted` or
+> `BPF load failed: PermissionDenied` in `~/.cache/netwatch/netwatch.log.*`
+> after an upgrade, the new binary just needs `setcap` re-applied.
+
 | Capability       | What it unlocks                                                                |
 |------------------|--------------------------------------------------------------------------------|
 | `cap_net_raw`    | Opening packet capture on a live interface (libpcap)                           |
@@ -99,11 +106,13 @@ which path is live.
 
 ### Security sandbox (Linux)
 
-Once pcap and the eBPF kprobe are up, netwatch hands those elevated
+Available on **v0.17.1+** (`v0.17.0` had a regression — see below). Once
+pcap, PKTAP, and the eBPF kprobe finish setup, netwatch hands the elevated
 capabilities back and locks itself into a Landlock-enforced filesystem
-allow-list — so a memory-safety bug in DPI parsing can't read SSH keys
-or pivot via a new raw socket. Default is best-effort; production
-deployments that want a hard guarantee should use strict mode.
+allow-list — so a memory-safety bug in DPI parsing can't read SSH keys,
+exfiltrate browser profiles, or pivot via a new raw socket. Default is
+best-effort; production deployments that want a hard guarantee should use
+strict mode.
 
 ```bash
 netwatch                     # best-effort sandbox (default)
@@ -113,13 +122,22 @@ netwatch --no-sandbox        # escape hatch for debugging
 
 What gets restricted:
 
-- **Capabilities dropped post-init**: `CAP_NET_RAW`, `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`. The pcap fd stays open and the kprobe stays attached; the process just can't acquire any *new* raw sockets or load any *new* BPF programs.
-- **Filesystem allow-list** (kernel-enforced, independent of DAC): `/proc`, system resolver files, zoneinfo, CA bundles, the user's `~/.config/netwatch/` and configured GeoIP DB dirs are read-only. `~/.cache/netwatch/` (logs + Flight Recorder bundles), startup CWD (PCAP exports), `/tmp`, and `/run/user/<uid>` are read-write. Everything else `EACCES`.
-- **Live verification**: the Settings overlay shows the enforcement state — `best-effort: Landlock ABI V4, 3 caps dropped` — so you can confirm at runtime that the sandbox actually applied, not just that the binary advertises it.
+- **Capabilities dropped post-init**: `CAP_NET_RAW`, `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`. The existing pcap fd stays open and the eBPF kprobe stays attached; the process just can't acquire any *new* raw sockets or load any *new* BPF programs.
+- **Filesystem read allow-list** (kernel-enforced, independent of DAC): `/proc`, `/sys`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, plus a narrow enumerated set of `/etc/*` files for NSS / TLS / time (`resolv.conf`, `hosts`, `services`, `nsswitch.conf`, `passwd`, `group`, `os-release`, `ssl`, `pki`, `ca-certificates`, `ld.so.*`, etc.), plus `~/.config/netwatch/` and configured GeoIP DB parent dirs. The `/etc/*` list is deliberately enumerated rather than allow-all so a sudo'd netwatch still can't read `/etc/shadow` or `/etc/sudoers` through the sandbox. Everything outside the allow-list returns `EACCES` — including `/home/<other-user>/`, `/root/`, browser profiles, SSH keys.
+- **Filesystem write allow-list**: `~/.cache/netwatch/` (logs + Flight Recorder bundles), the startup working directory (PCAP exports), `/tmp`, `/run/user/<uid>`, and `/dev/null`. Note that the export directory is captured at startup — change it via Settings without restarting and exports will fail.
+- **Live verification**: the Settings overlay (press `S`) shows the enforcement state — `best-effort: Landlock ABI Vx, 3 caps dropped` — so you can confirm at runtime that the sandbox actually applied, not just that the binary advertises it.
 
-Network restriction (TCP bind/connect block) is intentionally not enabled — it would silently break the ip-api.com GeoIP fallback, `--remote` streaming, and inline WHOIS. The threat model the sandbox is built for (exploitable DPI parsing of hostile capture traffic on a production host) is well served by filesystem and capability restrictions alone.
+Network restriction (TCP bind/connect block) is intentionally not enabled — it would silently break the ip-api.com GeoIP fallback, `--remote` streaming, and inline WHOIS. The threat model the sandbox defends against (exploitable DPI parsing of hostile capture traffic on a production host) is well served by filesystem and capability restrictions alone.
 
 macOS and Windows are not on the sandbox roadmap. The threat the sandbox defends against is production-capture-specific, and that audience is overwhelmingly Linux; building Seatbelt or Windows-token wrappers would buy feature-matrix parity with neighbouring tools without buying users meaningful security.
+
+> **v0.17.0 regression — upgrade to v0.17.1.** The v0.17.0 allow-list was
+> missing `/sys`, `/bin`/`/sbin`/`/usr`, and several `/etc/*` files, so on
+> Linux with the default sandbox enabled the Dashboard and Interfaces tabs
+> rendered blank (the interface-info reader at `src/platform/linux.rs`
+> swallows fs errors via `unwrap_or_default()`, hiding the EACCES). The
+> workaround on v0.17.0 was `netwatch --no-sandbox`; v0.17.1 expands the
+> allow-list and is the correct version to install.
 
 ### Flight Recorder
 
