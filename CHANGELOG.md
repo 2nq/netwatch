@@ -2,6 +2,14 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.17.1] - 2026-05-23
+
+### Fixed
+- **Sandbox no longer breaks the Dashboard / Interfaces tabs on Linux.** The v0.17.0 Landlock allow-list omitted `/sys`, `/bin`, `/sbin`, `/usr` (the executable + library roots), and `/etc/{passwd,group,os-release,ld.so.*}` — so any reads from `/sys/class/net/*/{statistics,operstate,carrier,mtu,address,wireless}` returned EACCES, every subprocess (`ss`, `lsof`, `ip`, `traceroute`, `whois`) failed to execve under the policy, and `getaddrinfo` couldn't load NSS modules. The interface-info reader in `src/platform/linux.rs` swallows those errors via `unwrap_or_default()`, so the symptom was "everything blank" rather than a visible error in the log.
+- The allow-list now covers `/proc`, `/sys`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, plus a narrow set of `/etc/*` files for NSS / TLS / time (deliberately narrow so a sudo'd netwatch still can't read `/etc/shadow` or `/etc/sudoers` through the sandbox), plus `/run/systemd/resolve` and `/run/dbus`. RW restriction (cache dir, CWD, `/tmp`, `/run/user/<uid>`) is unchanged.
+
+If you hit the v0.17.0 regression, `netwatch --no-sandbox` was a working workaround; v0.17.1 makes that unnecessary.
+
 ## [0.17.0] - 2026-05-23
 
 ### Added

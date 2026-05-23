@@ -90,15 +90,37 @@ fn cap_name(cap: Capability) -> &'static str {
 
 /// Paths we need to be able to read once restricted. Order doesn't
 /// matter; missing paths are silently skipped.
+///
+/// The allow-list is intentionally broad on system dirs (`/proc`, `/sys`,
+/// `/usr`, `/etc`, `/bin`, `/sbin`, `/lib`) — those contain no per-user
+/// secrets and are needed by every subprocess (`ss`, `lsof`, `ip`,
+/// `traceroute`, `whois`) that inherits the Landlock policy. The
+/// confidentiality benefit comes from omitting `/home`, `/root`,
+/// `/var/lib/*`, mail spools, browser profiles, etc.
 fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
-    // procfs — required for the lsof/ss/procfs attribution fallback.
-    out.push(PathBuf::from("/proc"));
-
-    // System resolver + service-name files. getaddrinfo() also touches
-    // NSS modules in /lib and /usr/lib, so allow those broadly.
     for path in [
+        // procfs — interface counters, /proc/net/dev, process attribution.
+        "/proc",
+        // sysfs — interface info, statistics, wireless detection
+        // (`/sys/class/net/*/{statistics,operstate,carrier,mtu,address,wireless}`).
+        "/sys",
+        // Executables the connection / topology / WHOIS collectors spawn
+        // (ss, lsof, ip, traceroute, whois, host). Landlock applies its
+        // policy to children, so the children also need Execute on
+        // their own binaries. Allow these broadly.
+        "/bin",
+        "/sbin",
+        "/usr",
+        // Dynamic linker / shared library load paths.
+        "/lib",
+        "/lib64",
+        // System resolver + service-name files. getaddrinfo() walks NSS
+        // modules from /usr/lib/x86_64-linux-gnu/libnss_*.so plus
+        // /etc/{passwd,group,nsswitch.conf}. Narrow list (instead of
+        // allow-all /etc) is deliberate so a sudo'd netwatch can't read
+        // /etc/shadow or /etc/sudoers through the sandbox.
         "/etc/resolv.conf",
         "/etc/hosts",
         "/etc/services",
@@ -106,19 +128,21 @@ fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
         "/etc/host.conf",
         "/etc/gai.conf",
         "/etc/protocols",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/os-release",
         "/etc/localtime",
         "/etc/timezone",
         "/etc/ssl",
         "/etc/pki",
         "/etc/ca-certificates",
-        "/usr/share/zoneinfo",
-        "/usr/share/ca-certificates",
-        "/usr/share/locale",
-        "/usr/lib",
-        "/lib",
-        "/lib64",
-        "/usr/lib64",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d",
+        // systemd-resolved socket dir (NSS via systemd-resolved variant).
         "/run/systemd/resolve",
+        // DBus runtime dir for tools that talk to system services.
+        "/run/dbus",
     ] {
         out.push(PathBuf::from(path));
     }
