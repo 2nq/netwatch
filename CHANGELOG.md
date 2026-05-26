@@ -2,6 +2,12 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.4] - 2026-05-26
+
+### Fixed
+- **Health widget no longer reports a fake 100% loss when the system advertises an IPv6 link-local DNS server.** `dns_servers.first()` picked whichever nameserver appeared first in `/etc/resolv.conf` — on macOS with IPv6 RA-discovered DNS, that's the link-local entry (e.g. `fe80::96ea:eaff:fe05:f074`) listed ahead of the routable IPv4 server. The native ICMP probe can't reach link-local targets because `IpAddr::parse` rejects the `%en0` zone identifier they require, so every probe failed and the Dashboard's DNS card showed "100% loss" even though the host's *other* DNS server was healthy. Added `NetworkConfig::primary_dns()` which skips `fe80::/10` and falls through to the next entry, so we now probe (and label) the routable IPv4 fallback. Globally-routable IPv6 nameservers (e.g. `2001:4860:4860::8888`) are still preferred over IPv4 when they come first — only link-local is skipped. ([#31](https://github.com/matthart1983/netwatch/issues/31))
+- **scutil `--dns` parser no longer mangles IPv6 nameservers.** The previous parser split each `nameserver[N] : <addr>` line on every `:` and took index 1, which truncated any IPv6 address to its first hextet (`fe80::1` became `fe80`). Switched to `split_once(':')` so the address survives the parse. (Not what triggered #31 — macOS reads `/etc/resolv.conf` first and never reaches the scutil branch when that file is non-empty — but it was waiting to bite anyone whose resolv.conf was empty or unavailable.)
+
 ## [0.21.3] - 2026-05-24
 
 ### Fixed

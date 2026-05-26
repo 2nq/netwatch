@@ -928,7 +928,7 @@ impl App {
         if self.health_tick >= 5 {
             self.health_tick = 0;
             let gateway = self.config_collector.config.gateway.clone();
-            let dns = self.config_collector.config.dns_servers.first().cloned();
+            let dns = self.config_collector.config.primary_dns();
             self.health_prober.probe(gateway.as_deref(), dns.as_deref());
             self.process_bandwidth.refresh_cpu();
         }
@@ -1111,7 +1111,7 @@ pub async fn run<B: Backend>(
         app.connection_timeline.update(&conns);
     }
     let gateway = app.config_collector.config.gateway.clone();
-    let dns = app.config_collector.config.dns_servers.first().cloned();
+    let dns = app.config_collector.config.primary_dns();
     app.health_prober.probe(gateway.as_deref(), dns.as_deref());
     // Kick off a one-shot traceroute so the topology view's ISP gateway hop
     // is populated without requiring the user to press T first.
@@ -1910,7 +1910,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.connection_collector.update();
             app.config_collector.update();
             let gateway = app.config_collector.config.gateway.clone();
-            let dns = app.config_collector.config.dns_servers.first().cloned();
+            let dns = app.config_collector.config.primary_dns();
             app.health_prober.probe(gateway.as_deref(), dns.as_deref());
         }
         KeyCode::Char('R') => match app.incident_recorder.state() {

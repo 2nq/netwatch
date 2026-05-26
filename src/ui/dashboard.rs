@@ -853,9 +853,7 @@ fn render_health(f: &mut Frame, app: &App, area: Rect) {
     let dns_label = app
         .config_collector
         .config
-        .dns_servers
-        .first()
-        .cloned()
+        .primary_dns()
         .unwrap_or_else(|| "—".into());
 
     render_health_target(
