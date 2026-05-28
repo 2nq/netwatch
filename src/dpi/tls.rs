@@ -34,6 +34,46 @@ use super::{AppProtocol, Classifier};
 /// with this type code.
 const ECH_EXTENSION_TYPE: u16 = 0xfe0d;
 
+/// Pull the 32-byte `client_random` out of a TLS ClientHello record.
+/// Used by the TLS-decryption path to key per-flow secrets in the
+/// SSLKEYLOGFILE; the keylog uses `client_random` as its lookup key.
+/// Returns `None` for non-TLS, non-ClientHello, or malformed input.
+pub fn extract_client_random(payload: &[u8]) -> Option<[u8; 32]> {
+    // Same fast-reject as TlsClassifier: TLS records start with
+    // content_type=0x16 (handshake) and major version 0x03.
+    if payload.len() < 5 || payload[0] != 0x16 || payload[1] != 0x03 {
+        return None;
+    }
+    let (_, record) = parse_tls_plaintext(payload).ok()?;
+    for msg in record.msg {
+        if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg {
+            if ch.random.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(ch.random);
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
+/// Pull the negotiated cipher suite ID out of a TLS ServerHello.
+/// Required by the decryption path: the SSLKEYLOGFILE stores AEAD
+/// secrets but not the chosen cipher, so we read it off the wire.
+/// Returns `None` for non-TLS, non-ServerHello, or malformed input.
+pub fn extract_server_hello_cipher_suite(payload: &[u8]) -> Option<u16> {
+    if payload.len() < 5 || payload[0] != 0x16 || payload[1] != 0x03 {
+        return None;
+    }
+    let (_, record) = parse_tls_plaintext(payload).ok()?;
+    for msg in record.msg {
+        if let TlsMessage::Handshake(TlsMessageHandshake::ServerHello(sh)) = msg {
+            return Some(sh.cipher.0);
+        }
+    }
+    None
+}
+
 /// `true` when the extension list contains an `encrypted_client_hello`
 /// extension. Used by both the TLS classifier and any downstream caller
 /// (e.g. QUIC ECH detection if added) that has already parsed
@@ -378,6 +418,30 @@ mod tests {
         // Append an empty ECH extension: type 0xfe0d, length 0x0000.
         bytes.extend_from_slice(&[0xfe, 0x0d, 0x00, 0x00]);
         bytes
+    }
+
+    #[test]
+    fn extract_client_random_returns_32_bytes_from_fixture() {
+        // CLIENT_HELLO_EXAMPLE_COM has the legacy_version 0x0303 at
+        // offset 9..=10, then the 32-byte random at 11..=42. Verify
+        // we extract those 32 bytes verbatim.
+        let cr = extract_client_random(CLIENT_HELLO_EXAMPLE_COM)
+            .expect("Python ssl fixture has a ClientHello");
+        assert_eq!(&cr[..], &CLIENT_HELLO_EXAMPLE_COM[11..=42]);
+    }
+
+    #[test]
+    fn extract_client_random_rejects_non_tls_payloads() {
+        assert!(extract_client_random(b"GET / HTTP/1.1\r\n\r\n").is_none());
+        assert!(extract_client_random(&[]).is_none());
+        assert!(extract_client_random(&[0x16, 0x03]).is_none());
+    }
+
+    #[test]
+    fn extract_server_hello_cipher_suite_rejects_clienthello() {
+        // ClientHello is content_type 0x16 + handshake_type 0x01;
+        // our extractor only returns Some for ServerHellos (0x02).
+        assert!(extract_server_hello_cipher_suite(CLIENT_HELLO_EXAMPLE_COM).is_none());
     }
 
     #[test]

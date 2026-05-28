@@ -75,6 +75,20 @@ pub struct NetwatchConfig {
     /// with.
     #[serde(default = "default_sandbox")]
     pub sandbox: String,
+
+    /// Path to an NSS `SSLKEYLOGFILE` containing per-connection TLS
+    /// secrets exported by a cooperating client (Chrome, Firefox, Node,
+    /// curl with `--ssl-no-revoke` etc.). When non-empty, netwatch
+    /// reads this file and uses the secrets to decrypt observed TLS
+    /// 1.3 Application Data records — same trick Wireshark uses.
+    ///
+    /// Empty (default) = no decryption. Decryption only works when:
+    ///   - You control the client process (it must export its secrets).
+    ///   - The client sets `SSLKEYLOGFILE=<this-path>` before launch.
+    ///   - The connection is TLS 1.3 (TLS 1.2 / QUIC application data /
+    ///     0-RTT not in scope for the initial implementation).
+    #[serde(default)]
+    pub tls_keylog_path: String,
 }
 
 fn default_sandbox() -> String {
@@ -116,6 +130,7 @@ impl Default for NetwatchConfig {
             graph_style: "bars".into(),
             graph_fade: false,
             sandbox: default_sandbox(),
+            tls_keylog_path: String::new(),
         }
     }
 }
@@ -274,6 +289,7 @@ show_geo = false
             graph_style: "bars".into(),
             graph_fade: false,
             sandbox: "strict".into(),
+            tls_keylog_path: "/tmp/sslkeylog.txt".into(),
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();

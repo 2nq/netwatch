@@ -26,6 +26,7 @@ pub mod ssdp;
 pub mod ssh;
 pub mod stun;
 pub mod tls;
+pub mod tls_decrypt;
 
 use serde::{Deserialize, Serialize};
 
