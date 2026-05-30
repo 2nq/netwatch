@@ -2,6 +2,18 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.24.0] - 2026-05-30
+
+### Added
+- **Passive TLS 1.3 application-data decryption via `SSLKEYLOGFILE`.** When a cooperating client process is launched with `SSLKEYLOGFILE` pointing at the path in the new `tls_keylog_path` config key, netwatch tails that NSS keylog, derives per-record AEAD keys, and decrypts TLS 1.3 Application Data on the Packets tab — the same trick Wireshark uses. Read-only and opt-in: only connections whose client cooperatively exported its secrets are decryptable (production / third-party / malware traffic is not). Supports `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, and `TLS_CHACHA20_POLY1305_SHA256`. Verified against the RFC 8448 §3 known-answer vector (full key-schedule → AEAD-open → inner-plaintext pipeline) and against live traffic. TLS 1.2, QUIC application data, and 0-RTT are out of scope for this phase.
+- **Decrypted-payload inspection.** Decrypted packets render bold-green in the list; the new `decrypted:true|false` filter selects them, and `contains "…"` now searches decrypted plaintext too. The Protocol Detail and Payload Content panes show the recovered plaintext (the latter titled "Payload Content (TLS decrypted)"), and `y` copies the full payload to the clipboard.
+- **HTTP/1.x classifier** — extracts the method and `Host` header from requests and labels server responses (was a placeholder).
+- **SSH classifier** — identifies the RFC 4253 version banner, e.g. `SSH-2.0-OpenSSH_9.0` (was a placeholder).
+
+### Fixed
+- **Keylog watcher race.** A flow's first application-data records routinely arrive before the keylog secret has been ingested; previously that permanently disabled decryption for the stream. A keylog miss is now retryable (only a missed ClientHello or an unsupported cipher disables a stream), `decrypt_record_resync` recovers the correct record sequence after late-arriving secrets, and the watcher poll was tightened from 500ms to 100ms.
+- **Packet filter ignored by the detail pane, scroll, and click.** With a filter applied, scrolling (mouse/arrows), clicking, and the detail pane indexed the full capture instead of the filtered view, so a stale selection or a scroll past the filtered rows rendered details for packets not shown in the list (even when the filter matched nothing). The list, detail pane, scroll, and click now share one filtered view.
+
 ## [0.21.7] - 2026-05-26
 
 ### Fixed
