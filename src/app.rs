@@ -1450,15 +1450,19 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         if clicked_row > 0 {
                             let visible_row = clicked_row - 1;
                             let packets = app.packet_collector.get_packets();
+                            // Index into the filtered view (what's on screen),
+                            // not the full capture, so clicking a row selects
+                            // the packet actually shown there.
+                            let visible = crate::ui::packets::visible_packets(app, &packets);
                             let scroll_base = if app.ui.packet_follow {
                                 let visible_height =
                                     (content_bottom - content_top).saturating_sub(1) as usize;
-                                packets.len().saturating_sub(visible_height)
+                                visible.len().saturating_sub(visible_height)
                             } else {
                                 app.ui.scroll.packet_scroll
                             };
                             let idx = scroll_base + visible_row;
-                            if let Some(pkt) = packets.get(idx) {
+                            if let Some(pkt) = visible.get(idx) {
                                 app.ui.packet_follow = false;
                                 app.ui.scroll.packet_scroll = idx;
                                 app.ui.scroll.packet_selected = Some(pkt.id);
@@ -1535,9 +1539,13 @@ fn scroll_tab(app: &mut App, delta: isize) {
             } else {
                 app.ui.packet_follow = false;
                 let packets = app.packet_collector.get_packets();
-                let max = packets.len().saturating_sub(1);
+                // Scroll/select within the filtered view, not the full list,
+                // so a filter that hides packets can't be scrolled past into
+                // out-of-filter rows.
+                let visible = crate::ui::packets::visible_packets(app, &packets);
+                let max = visible.len().saturating_sub(1);
                 app.ui.scroll.packet_scroll = clamp_scroll(app.ui.scroll.packet_scroll, delta, max);
-                if let Some(pkt) = packets.get(app.ui.scroll.packet_scroll) {
+                if let Some(pkt) = visible.get(app.ui.scroll.packet_scroll) {
                     app.ui.scroll.packet_selected = Some(pkt.id);
                 }
             }

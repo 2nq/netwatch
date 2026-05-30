@@ -1,6 +1,7 @@
 use crate::app::{App, StreamDirectionFilter};
 use crate::collectors::packets::{
-    matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity, StreamDirection,
+    matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity, FilterExpr,
+    StreamDirection,
 };
 use ratatui::{
     prelude::*,
@@ -260,6 +261,36 @@ fn truncate_info(s: &str, max: usize) -> String {
     }
 }
 
+/// The filter expression currently applied to the packet list — the
+/// committed `packet_filter_active`, or the in-progress text while the user
+/// is typing one. `None` means show all. Centralized so the list, the detail
+/// pane, and scroll/selection all agree on which packets are visible (a
+/// selection or scroll position outside this set must not render details).
+pub fn effective_packet_filter(app: &App) -> Option<FilterExpr> {
+    let text = app
+        .ui
+        .packet_filter_active
+        .as_deref()
+        .or(if app.ui.packet_filter_input {
+            Some(app.ui.packet_filter_text.as_str())
+        } else {
+            None
+        });
+    text.and_then(parse_filter)
+}
+
+/// Packets visible under the active filter, in capture order. Borrows the
+/// passed slice; callers hold the packet-store guard for its lifetime.
+pub fn visible_packets<'a>(app: &App, packets: &'a [CapturedPacket]) -> Vec<&'a CapturedPacket> {
+    match effective_packet_filter(app) {
+        Some(expr) => packets
+            .iter()
+            .filter(|p| matches_packet(&expr, p))
+            .collect(),
+        None => packets.iter().collect(),
+    }
+}
+
 fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
     let header = Row::new(vec![
         Cell::from("!").style(Style::default().fg(app.theme.brand).bold()),
@@ -274,22 +305,11 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
     ])
     .height(1);
 
-    // Apply display filter
-    let filter_text = app
-        .ui
-        .packet_filter_active
-        .as_deref()
-        .or(if app.ui.packet_filter_input {
-            Some(app.ui.packet_filter_text.as_str())
-        } else {
-            None
-        });
-    let filter_expr = filter_text.and_then(parse_filter);
-
-    let filtered: Vec<&CapturedPacket> = if let Some(ref expr) = filter_expr {
-        packets.iter().filter(|p| matches_packet(expr, p)).collect()
-    } else {
-        packets.iter().collect()
+    // Apply display filter (shared with the detail pane and scroll/selection).
+    let filter_expr = effective_packet_filter(app);
+    let filtered: Vec<&CapturedPacket> = match &filter_expr {
+        Some(expr) => packets.iter().filter(|p| matches_packet(expr, p)).collect(),
+        None => packets.iter().collect(),
     };
 
     let visible_height = area.height.saturating_sub(3) as usize;
@@ -580,11 +600,16 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
 }
 
 fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
+    // Only render the selected packet if it's within the active filter —
+    // otherwise a stale selection (or a scroll position the filter excludes)
+    // would render details for a packet not shown in the list.
+    let filter = effective_packet_filter(app);
     let selected_pkt = app
         .ui
         .scroll
         .packet_selected
-        .and_then(|id| packets.iter().find(|p| p.id == id));
+        .and_then(|id| packets.iter().find(|p| p.id == id))
+        .filter(|p| filter.as_ref().is_none_or(|e| matches_packet(e, p)));
 
     match selected_pkt {
         Some(pkt) => {
