@@ -210,6 +210,10 @@ pub struct ConnectionCollector {
     pktap: Option<Arc<PktapAttributor>>,
     #[cfg(feature = "ebpf")]
     ebpf: Option<Arc<crate::ebpf::conn_tracker::EbpfAttributor>>,
+    /// Pre-sandbox `/proc` attribution snapshot for connections that predate
+    /// startup (see [`ProcSnapshot`]). `None` until attached.
+    #[cfg(target_os = "linux")]
+    proc_snapshot: Option<Arc<ProcSnapshot>>,
 }
 
 impl ConnectionCollector {
@@ -223,6 +227,8 @@ impl ConnectionCollector {
             pktap: None,
             #[cfg(feature = "ebpf")]
             ebpf: None,
+            #[cfg(target_os = "linux")]
+            proc_snapshot: None,
         }
     }
 
@@ -252,6 +258,15 @@ impl ConnectionCollector {
         self
     }
 
+    /// Attach the pre-sandbox `/proc` attribution snapshot. Set in `App::new`
+    /// before `sandbox::apply` so pre-existing connections stay attributable
+    /// even after Landlock blocks live `/proc/<pid>/fd` reads.
+    #[cfg(target_os = "linux")]
+    pub fn with_proc_snapshot(mut self, snapshot: Arc<ProcSnapshot>) -> Self {
+        self.proc_snapshot = Some(snapshot);
+        self
+    }
+
     pub fn update(&self) {
         if self.busy.load(Ordering::SeqCst) {
             tracing::trace!(target: "netwatch::connections", "update() skipped — previous spawn still running");
@@ -267,6 +282,8 @@ impl ConnectionCollector {
         let pktap = self.pktap.clone();
         #[cfg(feature = "ebpf")]
         let ebpf = self.ebpf.clone();
+        #[cfg(target_os = "linux")]
+        let proc_snapshot = self.proc_snapshot.clone();
         thread::spawn(move || {
             #[cfg(target_os = "macos")]
             let mut result = parse_lsof();
@@ -326,6 +343,14 @@ impl ConnectionCollector {
             #[cfg(feature = "ebpf")]
             if let Some(ebpf) = ebpf.as_ref() {
                 overlay_ebpf_attribution(&mut result, ebpf);
+            }
+
+            // Pre-sandbox snapshot fills connections that predate startup,
+            // which neither eBPF (only new connects) nor a live /proc scan
+            // (Landlock-blocked once sandboxed) can attribute.
+            #[cfg(target_os = "linux")]
+            if let Some(snap) = proc_snapshot.as_ref() {
+                overlay_proc_snapshot(&mut result, snap);
             }
 
             let count = result.len();
@@ -897,6 +922,55 @@ fn overlay_proc_attribution(connections: &mut [Connection]) {
             .and_then(|remote| index.by_pair.get(&(local, remote)).copied())
             .or_else(|| index.by_local.get(&local).copied());
         if let Some((pid, comm)) = inode.and_then(|i| owners.get(&i)) {
+            conn.pid = Some(*pid);
+            conn.process_name = Some(comm.clone());
+        }
+    }
+}
+
+/// Pre-sandbox `/proc` attribution snapshot: `(local, remote) → (pid, comm)`
+/// for every socket visible at capture time. Built ONCE at startup, *before*
+/// the Landlock sandbox is applied — Landlock's process-introspection scoping
+/// otherwise blocks reading other processes' `/proc/<pid>/fd`, so this is the
+/// only way to attribute connections that predate netwatch when sandboxed.
+/// (eBPF covers connections opened after startup.)
+#[cfg(target_os = "linux")]
+type ProcSnapshot = HashMap<((std::net::IpAddr, u16), (std::net::IpAddr, u16)), (u32, String)>;
+
+/// Capture the snapshot. Must be called before `sandbox::apply`. As root this
+/// sees every process; unprivileged it sees the caller's own — same visibility
+/// rules as `ss`/`/proc`.
+#[cfg(target_os = "linux")]
+pub fn capture_proc_snapshot() -> ProcSnapshot {
+    let index = proc_net_inode_index();
+    let owners = socket_inode_owners();
+    let mut out = HashMap::new();
+    for (pair, inode) in index.by_pair {
+        if let Some(owner) = owners.get(&inode) {
+            out.insert(pair, owner.clone());
+        }
+    }
+    out
+}
+
+/// Fill nameless connections from the pre-sandbox snapshot — sandbox-safe
+/// (no live `/proc` read). Matches on the full `(local, remote)` 5-tuple.
+#[cfg(target_os = "linux")]
+fn overlay_proc_snapshot(connections: &mut [Connection], snap: &ProcSnapshot) {
+    if snap.is_empty() {
+        return;
+    }
+    for conn in connections.iter_mut() {
+        if conn.process_name.is_some() {
+            continue;
+        }
+        let (Some(local), Some(remote)) = (
+            normalize_addr(&conn.local_addr),
+            normalize_addr(&conn.remote_addr),
+        ) else {
+            continue;
+        };
+        if let Some((pid, comm)) = snap.get(&(local, remote)) {
             conn.pid = Some(*pid);
             conn.process_name = Some(comm.clone());
         }

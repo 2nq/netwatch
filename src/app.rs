@@ -577,6 +577,17 @@ impl App {
             }
         }
 
+        // Capture a /proc attribution snapshot NOW — before the sandbox is
+        // applied (app::run does that after App::new returns). Landlock's
+        // process-introspection (ptrace) scoping later blocks reading other
+        // processes' /proc/<pid>/fd, so connections that already exist must be
+        // attributed here; eBPF handles connections opened afterward. See #38.
+        #[cfg(target_os = "linux")]
+        {
+            let snapshot = crate::collectors::connections::capture_proc_snapshot();
+            connection_collector = connection_collector.with_proc_snapshot(Arc::new(snapshot));
+        }
+
         let ui = AppUiState::from_config(&user_config);
 
         Self {
