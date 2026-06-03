@@ -1096,17 +1096,9 @@ impl PacketCollector {
         self.handle = Some(thread::spawn(move || {
             // Try with promiscuous mode first, fall back to non-promiscuous
             // (some interfaces like loopback don't support promisc on macOS)
-            // `immediate_mode(true)` is load-bearing, not just a latency
-            // tweak: on Linux, libpcap ≥1.5 uses TPACKET_V3, whose block-retire
-            // timeout never fires when zero packets arrive — so on an idle
-            // interface `next_packet()` blocks forever and the capture loop
-            // never re-checks the `capturing` flag, which wedges `stop_capture()`
-            // on quit (issue #41). Immediate mode drops to per-packet delivery
-            // (TPACKET_V2), where the read timeout fires even with no traffic.
             let cap = pcap::Capture::from_device(iface.as_str())
                 .and_then(|c| {
                     c.promisc(true)
-                        .immediate_mode(true)
                         .snaplen(CAPTURE_SNAPLEN)
                         .timeout(CAPTURE_TIMEOUT_MS)
                         .open()
@@ -1114,14 +1106,13 @@ impl PacketCollector {
                 .or_else(|_| {
                     pcap::Capture::from_device(iface.as_str()).and_then(|c| {
                         c.promisc(false)
-                            .immediate_mode(true)
                             .snaplen(CAPTURE_SNAPLEN)
                             .timeout(CAPTURE_TIMEOUT_MS)
                             .open()
                     })
                 });
 
-            let mut cap = match cap {
+            let cap = match cap {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = if e.to_string().contains("Permission denied") {
@@ -1131,6 +1122,25 @@ impl PacketCollector {
                     };
                     tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap open failed");
                     *error.lock().unwrap() = Some(msg);
+                    capturing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            // Switch to non-blocking capture. With a blocking read, libpcap's
+            // timeout is unreliable on idle links — on Linux (TPACKET_V3) the
+            // block-retire timer never fires with zero traffic, so
+            // `next_packet()` can block for seconds or forever and the loop
+            // never re-checks `capturing`. That wedged `stop_capture()`'s join
+            // on quit and interface switches (issue #41). In non-blocking mode
+            // `next_packet()` returns TimeoutExpired immediately when no packet
+            // is ready; the loop sleeps briefly instead, staying responsive to
+            // the stop flag (~50x/sec) so the thread exits cleanly in ~30ms.
+            let mut cap = match cap.setnonblock() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap setnonblock failed");
+                    *error.lock().unwrap() = Some(format!("Capture failed: {e}"));
                     capturing.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1218,7 +1228,11 @@ impl PacketCollector {
                         }
                     }
                     Err(pcap::Error::TimeoutExpired) => {
-                        // Flush any pending batch on timeout
+                        // Non-blocking mode returns this immediately when no
+                        // packet is ready. Flush any pending batch, then sleep
+                        // briefly so we don't busy-spin — while still re-checking
+                        // `capturing` ~50x/sec so quit and interface switches
+                        // stay responsive (issue #41).
                         if !batch.is_empty() {
                             let mut pkts = packets.write().unwrap();
                             pkts.extend(batch.drain(..));
@@ -1227,7 +1241,7 @@ impl PacketCollector {
                                 pkts.drain(0..excess);
                             }
                         }
-                        continue;
+                        thread::sleep(std::time::Duration::from_millis(20));
                     }
                     Err(_) => break,
                 }
