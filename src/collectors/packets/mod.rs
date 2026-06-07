@@ -867,7 +867,18 @@ impl StreamTracker {
         match dir.decrypt_record_resync(aad, ciphertext_src, TLS_RESYNC_WINDOW) {
             Ok(inner) => {
                 tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, plain_len=inner.content.len(), inner_type=inner.content_type, "decrypted record");
-                Some(inner.content)
+                // Only surface application_data (type 23) as decrypted plaintext.
+                // Post-handshake handshake messages (NewSessionTicket, type 22)
+                // and alerts (21) decrypt fine but are binary control records, not
+                // the conversation — dropping them keeps the detail pane and the
+                // "follow decrypted stream" view clean. The record's sequence was
+                // already advanced inside decrypt_record_resync, so returning None
+                // here does not desync the stream.
+                if inner.content_type == 23 {
+                    Some(inner.content)
+                } else {
+                    None
+                }
             }
             Err(e) => {
                 // Expected for handshake-secret records carried with outer
