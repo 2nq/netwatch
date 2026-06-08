@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
              --api-key <key>           API key for remote streaming\n    \
              --no-sandbox              Disable the post-startup security sandbox\n    \
              --sandbox-strict          Refuse to start if the sandbox can't be enforced\n    \
+             --metrics-addr <addr>     (daemon) Serve Prometheus /metrics + /healthz on addr\n    \
+             --metrics                 (daemon) Serve metrics on the default 127.0.0.1:9464\n    \
              -h, --help                Print help\n    -V, --version             Print version\n\n\
              KEYS (in TUI):\n    1-7   Switch tabs    /     Filter    q   Quit\n    \
              Shift+R/F/E   Flight Recorder: arm / freeze / export",
@@ -107,7 +109,28 @@ async fn main() -> Result<()> {
         .skip(1)
         .any(|a| a == "daemon" || a == "--daemon" || a == "--headless");
     if daemon_mode {
-        if let Err(e) = app::run_headless(remote_publisher.as_ref(), sandbox_mode).await {
+        // Optional Prometheus /metrics + /healthz endpoint (daemon only for now).
+        // `--metrics-addr <addr>`, or `--metrics` for the default, or the
+        // NETWATCH_METRICS_ADDR env var.
+        let metrics_addr = args
+            .windows(2)
+            .find(|w| w[0] == "--metrics-addr")
+            .map(|w| w[1].clone())
+            .or_else(|| std::env::var("NETWATCH_METRICS_ADDR").ok())
+            .or_else(|| {
+                args.iter()
+                    .any(|a| a == "--metrics")
+                    .then(|| netwatch::metrics::DEFAULT_METRICS_ADDR.to_string())
+            });
+        let metrics = metrics_addr.map(|addr| {
+            let exporter = netwatch::metrics::MetricsExporter::new(addr);
+            exporter.start();
+            exporter
+        });
+
+        if let Err(e) =
+            app::run_headless(remote_publisher.as_ref(), metrics.as_ref(), sandbox_mode).await
+        {
             eprintln!("Error: {e:?}");
         }
         return Ok(());

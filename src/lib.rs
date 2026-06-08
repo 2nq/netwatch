@@ -7,6 +7,7 @@ pub mod ebpf;
 pub mod event;
 pub mod graph;
 pub mod logging;
+pub mod metrics;
 pub mod platform;
 pub mod remote;
 pub mod sandbox;

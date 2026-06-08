@@ -1293,6 +1293,7 @@ async fn shutdown_signal() {
 /// entry point — `netwatch daemon`.
 pub async fn run_headless(
     remote: Option<&crate::remote::RemotePublisher>,
+    metrics: Option<&crate::metrics::MetricsExporter>,
     sandbox_mode: crate::sandbox::Mode,
 ) -> Result<()> {
     install_collector_panic_flag();
@@ -1334,6 +1335,7 @@ pub async fn run_headless(
         target: "netwatch::daemon",
         tick_rate_ms = tick_rate,
         remote = remote.is_some(),
+        metrics = metrics.is_some(),
         "netwatch daemon started"
     );
 
@@ -1346,13 +1348,22 @@ pub async fn run_headless(
         tokio::select! {
             _ = ticker.tick() => {
                 app.tick();
+                let healthy = !collectors_panicked();
                 if let Some(publisher) = remote {
                     publisher.update(
                         &app.traffic.interfaces(),
                         &app.health_prober,
                         &app.connection_collector,
                     );
-                    publisher.set_collectors_ok(!collectors_panicked());
+                    publisher.set_collectors_ok(healthy);
+                }
+                if let Some(exporter) = metrics {
+                    exporter.update(
+                        &app.traffic.interfaces(),
+                        &app.health_prober,
+                        &app.connection_collector,
+                    );
+                    exporter.set_collectors_ok(healthy);
                 }
             }
             _ = shutdown_signal() => {
