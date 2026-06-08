@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use uuid::Uuid;
@@ -10,6 +10,65 @@ use crate::collectors::connections::ConnectionCollector;
 use crate::collectors::health::HealthProber;
 use crate::collectors::traffic::InterfaceTraffic;
 
+mod queue;
+use queue::{Backoff, SnapshotQueue};
+
+/// Wire-format version sent in every envelope. Bump on a breaking change to the
+/// payload shape; the backend uses it to route/validate. New optional fields
+/// don't require a bump (consumers tolerate them via `#[serde(default)]`).
+const SCHEMA_VERSION: u32 = 1;
+
+/// How often a fresh snapshot is enqueued for delivery. The capture side
+/// (`update`) refreshes the latest-slot every tick; we sample it at this
+/// cadence so ingest volume is independent of the UI refresh rate.
+const ENQUEUE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Bounded backlog. At one snapshot / 15s this is ~8.3h of buffering across a
+/// backend outage before the oldest data is shed.
+const QUEUE_CAP: usize = 2000;
+
+/// Max snapshots per POST when draining a backlog after reconnect.
+const BATCH_MAX: usize = 50;
+
+/// Sender-loop granularity. Small enough that retry backoff is responsive,
+/// large enough to be effectively free.
+const LOOP_TICK: Duration = Duration::from_millis(250);
+
+/// How the backend's response to an ingest POST is classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    /// 2xx — the batch was accepted; remove it from the queue.
+    Ack,
+    /// 4xx (auth/schema) — the batch will never succeed; drop it so a poison
+    /// payload can't wedge the queue forever. Still paced by backoff.
+    Poison,
+    /// 5xx / 408 / 429 / transport — transient; keep the batch and back off.
+    Retry,
+}
+
+/// Map an HTTP status code to a send outcome. Factored out for unit testing
+/// without standing up a network.
+fn outcome_for_status(code: u16) -> SendOutcome {
+    match code {
+        200..=299 => SendOutcome::Ack,
+        // Retry the genuinely transient client codes.
+        408 | 429 => SendOutcome::Retry,
+        // Other 4xx are our fault (bad key, bad schema) — don't retry forever.
+        400..=499 => SendOutcome::Poison,
+        // 5xx and anything else: assume the backend will recover.
+        _ => SendOutcome::Retry,
+    }
+}
+
+/// Cheap entropy for backoff jitter — low bits of the wall clock. No RNG dep,
+/// and good enough to desynchronize a reconnecting fleet's retries.
+fn jitter_entropy() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+}
+
 pub struct RemoteConfig {
     pub url: String,
     pub api_key: String,
@@ -18,7 +77,10 @@ pub struct RemoteConfig {
 pub struct RemotePublisher {
     config: RemoteConfig,
     host_id: Uuid,
+    /// Latest snapshot produced by the capture side, overwritten each tick.
     snapshot_data: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Durable backlog drained by the sender thread.
+    queue: Arc<SnapshotQueue>,
 }
 
 impl RemotePublisher {
@@ -27,6 +89,7 @@ impl RemotePublisher {
             config,
             host_id: Uuid::new_v4(),
             snapshot_data: Arc::new(Mutex::new(None)),
+            queue: Arc::new(SnapshotQueue::new(QUEUE_CAP)),
         }
     }
 
@@ -35,37 +98,92 @@ impl RemotePublisher {
         let api_key = self.config.api_key.clone();
         let host_id = self.host_id;
         let data = self.snapshot_data.clone();
+        let queue = self.queue.clone();
 
         thread::spawn(move || {
             let host_info = collect_host_info(host_id);
+            let endpoint = format!("{}/api/v1/ingest", url);
+            let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(60));
+
+            // Enqueue immediately on first available snapshot, then on cadence.
+            let mut last_enqueue: Option<Instant> = None;
+            // Earliest time a send attempt is permitted (advanced by backoff).
+            let mut next_send_at = Instant::now();
 
             loop {
-                thread::sleep(Duration::from_secs(15));
+                thread::sleep(LOOP_TICK);
+                let now = Instant::now();
 
-                let snapshot = {
-                    let lock = safe_lock(&data, "remote::ingest_loop");
-                    lock.clone()
+                // 1. Sample the latest snapshot into the durable queue on cadence.
+                let due = match last_enqueue {
+                    None => true,
+                    Some(t) => now.duration_since(t) >= ENQUEUE_INTERVAL,
                 };
+                if due {
+                    let snapshot = {
+                        let lock = safe_lock(&data, "remote::ingest_loop");
+                        lock.clone()
+                    };
+                    if let Some(snapshot) = snapshot {
+                        queue.push(snapshot);
+                        last_enqueue = Some(now);
+                    }
+                }
 
-                let Some(snapshot) = snapshot else { continue };
+                // 2. Drain the backlog, honoring the backoff window.
+                if queue.is_empty() || now < next_send_at {
+                    continue;
+                }
 
+                let batch = queue.peek_batch(BATCH_MAX);
                 let body = json!({
+                    "schema_version": SCHEMA_VERSION,
                     "agent_version": format!("netwatch-tui/{}", env!("CARGO_PKG_VERSION")),
                     "host": host_info,
-                    "snapshots": [snapshot],
+                    "snapshots": batch,
+                    "agent_health": {
+                        // TODO(Workstream B): wire real collector liveness from the
+                        // daemon supervisor. Until then we only attest delivery health.
+                        "collectors_ok": true,
+                        "dropped_count": queue.dropped(),
+                        "queue_depth": queue.len(),
+                    },
                 });
 
-                let endpoint = format!("{}/api/v1/ingest", url);
-                if let Err(e) = ureq::post(&endpoint)
+                let result = ureq::post(&endpoint)
                     .set("Authorization", &format!("Bearer {}", api_key))
                     .set("Content-Type", "application/json")
-                    .send_json(body)
-                {
-                    // Fire-and-forget today; a future change in Phase 3 of the
-                    // refactoring plan adds retries + a bounded buffer. For
-                    // now, surface the failure so a user reporting "remote
-                    // streaming isn't working" can hand over a log.
-                    tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, "ingest POST failed");
+                    .send_json(body);
+
+                let outcome = match &result {
+                    Ok(_) => SendOutcome::Ack,
+                    Err(ureq::Error::Status(code, _)) => outcome_for_status(*code),
+                    // Transport-level (DNS, connect, TLS, timeout) — transient.
+                    Err(ureq::Error::Transport(_)) => SendOutcome::Retry,
+                };
+
+                match outcome {
+                    SendOutcome::Ack => {
+                        queue.remove(batch.len());
+                        backoff.reset();
+                        next_send_at = now;
+                    }
+                    SendOutcome::Poison => {
+                        if let Err(e) = &result {
+                            tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, batch = batch.len(), "dropping unacceptable ingest batch (4xx)");
+                        }
+                        // Drop the poison batch so it can't wedge the queue, but
+                        // pace the drain so we don't hammer on a persistent 4xx.
+                        queue.remove(batch.len());
+                        next_send_at = now + backoff.fail(jitter_entropy());
+                    }
+                    SendOutcome::Retry => {
+                        let delay = backoff.fail(jitter_entropy());
+                        next_send_at = now + delay;
+                        if let Err(e) = &result {
+                            tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, retry_in_ms = delay.as_millis(), queued = queue.len(), "ingest POST failed; will retry");
+                        }
+                    }
                 }
             }
         });
@@ -411,5 +529,26 @@ fn parse_size(s: &str) -> Option<u64> {
             .map(|v| (v * 1024.0 * 1024.0 * 1024.0) as u64)
     } else {
         s.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_classification() {
+        assert_eq!(outcome_for_status(200), SendOutcome::Ack);
+        assert_eq!(outcome_for_status(202), SendOutcome::Ack);
+        // Auth / schema problems are our fault — don't retry forever.
+        assert_eq!(outcome_for_status(400), SendOutcome::Poison);
+        assert_eq!(outcome_for_status(401), SendOutcome::Poison);
+        assert_eq!(outcome_for_status(404), SendOutcome::Poison);
+        // Transient client codes are retryable.
+        assert_eq!(outcome_for_status(408), SendOutcome::Retry);
+        assert_eq!(outcome_for_status(429), SendOutcome::Retry);
+        // Server errors recover.
+        assert_eq!(outcome_for_status(500), SendOutcome::Retry);
+        assert_eq!(outcome_for_status(503), SendOutcome::Retry);
     }
 }
