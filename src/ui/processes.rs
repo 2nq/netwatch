@@ -398,7 +398,11 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
     );
 
     let conns = app.connection_collector.connections();
-    let mut totals: HashMap<String, u32> = HashMap::new();
+    // Aggregate REAL per-host traffic from per-connection rates (the packet
+    // capture path), not a proportional split of the process byte total by
+    // connection count — two remotes with equal connection counts must not
+    // report identical traffic. host -> (rate B/s, connection count).
+    let mut per_host: HashMap<String, (f64, u32)> = HashMap::new();
     for c in conns.iter() {
         let conn_name = c
             .process_name
@@ -414,12 +418,22 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
         if host.is_empty() {
             continue;
         }
-        *totals.entry(host).or_insert(0) += 1;
+        let entry = per_host.entry(host).or_insert((0.0, 0));
+        entry.0 += c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0);
+        entry.1 += 1;
     }
     drop(conns);
 
-    let mut sorted: Vec<(String, u32)> = totals.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Sort by measured rate; fall back to connection count when no capture
+    // data is available so the list is still ordered sensibly.
+    let mut sorted: Vec<(String, f64, u32)> =
+        per_host.into_iter().map(|(h, (r, n))| (h, r, n)).collect();
+    sorted.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     if sorted.is_empty() {
         f.render_widget(
@@ -433,20 +447,17 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
     }
 
     let max_rows = area.height.saturating_sub(1) as usize;
-    let total_conns = sorted.iter().map(|(_, n)| *n).sum::<u32>().max(1);
 
-    for (i, (host, n)) in sorted.iter().take(max_rows.min(5)).enumerate() {
+    for (i, (host, rate, _n)) in sorted.iter().take(max_rows.min(5)).enumerate() {
         let row_y = area.y + 1 + i as u16;
-        // Approximate per-host bytes by proc.rx_bytes * (n / total_conns)
-        let approx_bytes = (proc.rx_bytes as f64 * (*n as f64 / total_conns as f64)).round() as u64;
-        let label_w = (area.width as usize).saturating_sub(10).max(8);
+        let label_w = (area.width as usize).saturating_sub(11).max(8);
         let line = Line::from(vec![
             Span::styled(
                 format!("{:<width$}", truncate(host, label_w), width = label_w),
                 Style::default().fg(t.text_primary),
             ),
             Span::styled(
-                format!(" {:>7}", widgets::format_bytes_total(approx_bytes)),
+                format!(" {:>9}", widgets::format_bytes_rate(*rate)),
                 Style::default().fg(t.rx_rate),
             ),
         ]);
