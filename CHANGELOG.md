@@ -7,6 +7,25 @@ All notable changes to NetWatch will be documented in this file.
 ### Added
 - **Follow decrypted stream.** The stream view (`s` on the Packets tab) now renders the **decrypted** application-data conversation for flows decrypted via `SSLKEYLOGFILE`, instead of the raw encrypted wire bytes. Each segment's recovered plaintext is mirrored from the packet onto its stream segment, so opening a decrypted flow shows the full plaintext HTTP request/response exchange in order — both directions, in Text and Hex modes. The encrypted handshake is omitted from the decrypted view so the request/response flow reads cleanly (its timing still shows in the header), and a "🔓 decrypted" indicator appears in the stream header. (Previously the stream view followed only the encrypted bytes, which rendered as gibberish for any TLS/QUIC flow.)
 
+## [0.25.3] - 2026-06-03
+
+### Fixed
+- **Quit / tab-switch could hang on idle interfaces.** Capture now runs non-blocking, so quitting or switching tabs can't stall waiting on a silent link (fully resolves #41).
+
+## [0.25.2] - 2026-06-03
+
+### Fixed
+- **Quit could hang on idle interfaces.** Enabled libpcap `immediate_mode` so a quit isn't blocked waiting for the next packet on a quiet interface (#41). Superseded by the non-blocking capture in 0.25.3.
+
+## [0.25.1] - 2026-06-02
+
+### Added
+- **Process attribution for pre-existing connections.** A pre-sandbox `/proc` snapshot captures processes for connections that predate startup, plus native `/proc` attribution so processes show without `ss -p` (#38/#40).
+
+### Fixed
+- **eBPF attribution keying** on `(daddr, dport)` to match the netwatch-sdk `uaddr` fix.
+- **Windows UTF-8 output** — embed a UTF-8 active-code-page manifest so text renders correctly in non-UTF-8 locales (#39).
+
 ## [0.25.0] - 2026-05-31
 
 ### Added

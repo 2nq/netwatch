@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// User-facing persistent configuration, stored at
-/// `~/.config/netwatch/config.toml`.
+/// User-facing persistent configuration, stored as `netwatch/config.toml`
+/// under the platform config directory (`dirs::config_dir()`): `~/.config` on
+/// Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetwatchConfig {
@@ -148,7 +149,9 @@ impl Default for AlertConfig {
 // ── Persistence ────────────────────────────────────────────
 
 impl NetwatchConfig {
-    /// Returns `~/.config/netwatch/config.toml`
+    /// Path to `netwatch/config.toml` under the platform config dir
+    /// (`~/.config` on Linux, `~/Library/Application Support` on macOS,
+    /// `%APPDATA%` on Windows).
     pub fn path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("netwatch").join("config.toml"))
     }
