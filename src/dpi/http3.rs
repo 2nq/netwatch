@@ -445,6 +445,7 @@ impl H3StreamReassembler {
             let clen = st.contiguous_len();
             if clen > st.decoded_len {
                 st.decoded_len = clen;
+                let prev_len = st.decoded.as_ref().map(|d| d.bytes.len());
                 st.decoded = h3_data_payload(&st.data[..clen])
                     .and_then(|body| decompress_body(&body))
                     .map(|(encoding, bytes)| DecodedBody {
@@ -452,6 +453,21 @@ impl H3StreamReassembler {
                         stream_id: chunk.stream_id,
                         bytes,
                     });
+                if let Some(body) = &st.decoded {
+                    if Some(body.bytes.len()) != prev_len {
+                        // `prefix_bytes` is the contiguous *compressed* prefix; a
+                        // value past one packet's worth (~1200 B) means this body
+                        // was reassembled across multiple 1-RTT packets.
+                        tracing::debug!(
+                            target: "netwatch::dpi::http3",
+                            stream_id = chunk.stream_id,
+                            prefix_bytes = clen,
+                            body_bytes = body.bytes.len(),
+                            encoding = body.encoding.label(),
+                            "reassembled HTTP/3 body"
+                        );
+                    }
+                }
             }
         }
     }
