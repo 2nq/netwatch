@@ -2,13 +2,16 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.25.5] - 2026-06-08
 
 ### Added
 - **Cross-packet HTTP/3 stream reassembly (QUIC decryption Phase 3b).** HTTP/3 response bodies that span more than one QUIC 1-RTT packet now reassemble and decompress instead of truncating. A new `H3StreamReassembler` accumulates decrypted STREAM-frame bytes per HTTP/3 stream id, indexed by offset, across packets, and decodes the contiguous prefix from byte 0 (gzip/deflate/brotli) — so a body is recovered once its head and a contiguous run are present, even when packets arrive out of order. The reassembled body shows in the Protocol Detail and Payload Content panes and in the `y` clipboard yank. Per-stream (2 MiB) and per-flow (64 streams) caps bound memory; zstd and identity bodies remain out of scope.
 
 ### Changed
 - **Decrypt layer surfaces only `application_data`** (TLS content-type 23): post-handshake NewSessionTicket (22) and alert (21) records no longer appear as "decrypted" plaintext, keeping the detail pane and stream view clean.
+
+### Fixed
+- **Stream view follows the selected packet.** Opening the stream view (`s`) now highlights the selected packet's bytes and scrolls to them, instead of always starting at the top of the stream.
 
 ## [0.25.4] - 2026-06-06
 
