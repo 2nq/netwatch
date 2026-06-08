@@ -105,6 +105,9 @@ pub struct AppUiState {
     pub stream_view_index: Option<u32>,
     pub stream_direction_filter: StreamDirectionFilter,
     pub stream_hex_mode: bool,
+    /// Packet id whose stream segment the stream view should highlight and
+    /// scroll to on open — the packet that was selected when `s` was pressed.
+    pub stream_view_focus_packet: Option<u64>,
 
     // ── Modal / overlay flags ──
     pub show_help: bool,
@@ -160,6 +163,7 @@ impl AppUiState {
             stream_view_index: None,
             stream_direction_filter: StreamDirectionFilter::Both,
             stream_hex_mode: false,
+            stream_view_focus_packet: None,
 
             show_help: false,
             show_memory_stats: false,

@@ -1997,6 +1997,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.stream_view_open = false;
             app.ui.stream_view_index = None;
             app.ui.scroll.stream_scroll = 0;
+            app.ui.stream_view_focus_packet = None;
         }
         KeyCode::Char('h') if app.ui.current_tab == Tab::Packets && app.ui.stream_view_open => {
             app.ui.stream_hex_mode = !app.ui.stream_hex_mode;
@@ -2039,15 +2040,31 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char('s') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
             if let Some(sel_id) = app.ui.scroll.packet_selected {
-                let packets = app.packet_collector.get_packets();
-                if let Some(pkt) = packets.iter().find(|p| p.id == sel_id) {
-                    if pkt.stream_index.is_some() {
-                        app.ui.stream_view_open = true;
-                        app.ui.stream_view_index = pkt.stream_index;
-                        app.ui.scroll.stream_scroll = 0;
-                        app.ui.stream_direction_filter = StreamDirectionFilter::Both;
-                        app.ui.stream_hex_mode = false;
-                    }
+                let idx = app
+                    .packet_collector
+                    .get_packets()
+                    .iter()
+                    .find(|p| p.id == sel_id)
+                    .and_then(|p| p.stream_index);
+                if let Some(idx) = idx {
+                    app.ui.stream_view_open = true;
+                    app.ui.stream_view_index = Some(idx);
+                    app.ui.stream_direction_filter = StreamDirectionFilter::Both;
+                    app.ui.stream_hex_mode = false;
+                    // Remember which packet was selected so the stream view
+                    // highlights it, and scroll so its bytes are on screen.
+                    app.ui.stream_view_focus_packet = Some(sel_id);
+                    let focus_line = app.packet_collector.get_stream(idx).and_then(|s| {
+                        crate::ui::packets::build_stream_lines(
+                            &s,
+                            false,
+                            StreamDirectionFilter::Both,
+                            Some(sel_id),
+                            &app.theme,
+                        )
+                        .1
+                    });
+                    app.ui.scroll.stream_scroll = focus_line.map_or(0, |l| l.saturating_sub(2));
                 }
             }
         }

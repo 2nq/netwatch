@@ -1048,6 +1048,107 @@ fn render_hex_ascii(
     f.render_widget(ascii, chunks[1]);
 }
 
+/// Build the stream-view content lines (hex or text) for `stream`, applying the
+/// decrypted-only filter, the dim-the-handshake rule, and the direction filter.
+/// When `focus_packet` is set, that packet's segment is highlighted and the
+/// index of its first content line is returned, so the `s` open-stream handler
+/// can scroll the view to the selected packet. Shared with `render_stream_view`
+/// so both agree on line layout.
+pub fn build_stream_lines(
+    stream: &crate::collectors::packets::Stream,
+    hex_mode: bool,
+    dir: StreamDirectionFilter,
+    focus_packet: Option<u64>,
+    theme: &crate::theme::Theme,
+) -> (Vec<Line<'static>>, Option<usize>, usize) {
+    let has_dec = stream.segments.iter().any(|s| s.decrypted.is_some());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut focus_first: Option<usize> = None;
+    let mut shown_segments = 0usize;
+
+    let segments = stream.segments.iter().filter(|seg| {
+        (!has_dec || seg.decrypted.is_some())
+            && match dir {
+                StreamDirectionFilter::Both => true,
+                StreamDirectionFilter::AtoB => seg.direction == StreamDirection::AtoB,
+                StreamDirectionFilter::BtoA => seg.direction == StreamDirection::BtoA,
+            }
+    });
+
+    for seg in segments {
+        shown_segments += 1;
+        let focus = focus_packet == Some(seg.packet_id);
+        if focus && focus_first.is_none() {
+            focus_first = Some(lines.len());
+        }
+        let arrow = match seg.direction {
+            StreamDirection::AtoB => "→",
+            StreamDirection::BtoA => "←",
+        };
+        let arrow_color = match seg.direction {
+            StreamDirection::AtoB => theme.status_good,
+            StreamDirection::BtoA => Color::Magenta,
+        };
+        let bytes = seg.decrypted.as_deref().unwrap_or(&seg.payload);
+        // Dim raw (handshake / undecrypted) segments once a decrypted
+        // conversation exists, so the plaintext reads clearly.
+        let dim = has_dec && seg.decrypted.is_none();
+        // The selected packet's segment gets a background highlight.
+        let bg = |st: Style| if focus { st.bg(theme.highlight_bg) } else { st };
+
+        if hex_mode {
+            let (hex_color, ascii_color) = if dim {
+                (theme.text_muted, theme.text_muted)
+            } else {
+                (theme.status_good, theme.status_warn)
+            };
+            for chunk in bytes.chunks(16) {
+                let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {arrow} "), bg(Style::default().fg(arrow_color))),
+                    Span::styled(format!("{:<50}", hex), bg(Style::default().fg(hex_color))),
+                    Span::styled(ascii, bg(Style::default().fg(ascii_color))),
+                ]));
+            }
+        } else {
+            let text_style = if dim {
+                Style::default().fg(theme.text_muted)
+            } else {
+                Style::default()
+            };
+            let text: String = bytes
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' || b == b'\t' {
+                        b as char
+                    } else if b == b'\n' || b == b'\r' {
+                        '\n'
+                    } else {
+                        '·'
+                    }
+                })
+                .collect();
+            for text_line in text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {arrow} "), bg(Style::default().fg(arrow_color))),
+                    Span::styled(text_line.to_string(), bg(text_style)),
+                ]));
+            }
+        }
+    }
+    (lines, focus_first, shown_segments)
+}
+
 fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
     let stream_index = match app.ui.stream_view_index {
         Some(idx) => idx,
@@ -1167,99 +1268,16 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
     // handshake is omitted so the request/response flow reads cleanly, the way
     // Wireshark's "Follow HTTP Stream" does. The header still shows the 🔓
     // indicator and handshake timing, so that context isn't lost.
-    let filtered_segments: Vec<_> = stream
-        .segments
-        .iter()
-        .filter(|seg| !stream_has_decrypted || seg.decrypted.is_some())
-        .filter(|seg| match app.ui.stream_direction_filter {
-            StreamDirectionFilter::Both => true,
-            StreamDirectionFilter::AtoB => seg.direction == StreamDirection::AtoB,
-            StreamDirectionFilter::BtoA => seg.direction == StreamDirection::BtoA,
-        })
-        .collect();
-
-    let content_lines: Vec<Line> = if app.ui.stream_hex_mode {
-        // Hex mode: concatenated hex dump of all segment payloads
-        let mut lines = Vec::new();
-        for seg in &filtered_segments {
-            let arrow = match seg.direction {
-                StreamDirection::AtoB => "→",
-                StreamDirection::BtoA => "←",
-            };
-            let arrow_color = match seg.direction {
-                StreamDirection::AtoB => app.theme.status_good,
-                StreamDirection::BtoA => Color::Magenta,
-            };
-            let bytes = seg.decrypted.as_deref().unwrap_or(&seg.payload);
-            // Dim raw (handshake / undecrypted) segments once a decrypted
-            // conversation exists, so the plaintext reads clearly.
-            let dim = stream_has_decrypted && seg.decrypted.is_none();
-            let (hex_color, ascii_color) = if dim {
-                (app.theme.text_muted, app.theme.text_muted)
-            } else {
-                (app.theme.status_good, app.theme.status_warn)
-            };
-            for chunk in bytes.chunks(16) {
-                let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
-                let ascii: String = chunk
-                    .iter()
-                    .map(|&b| {
-                        if b.is_ascii_graphic() || b == b' ' {
-                            b as char
-                        } else {
-                            '.'
-                        }
-                    })
-                    .collect();
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {arrow} "), Style::default().fg(arrow_color)),
-                    Span::styled(format!("{:<50}", hex), Style::default().fg(hex_color)),
-                    Span::styled(ascii, Style::default().fg(ascii_color)),
-                ]));
-            }
-        }
-        lines
-    } else {
-        // Text mode: payload as readable text with direction arrows
-        let mut lines = Vec::new();
-        for seg in &filtered_segments {
-            let arrow = match seg.direction {
-                StreamDirection::AtoB => "→",
-                StreamDirection::BtoA => "←",
-            };
-            let arrow_color = match seg.direction {
-                StreamDirection::AtoB => app.theme.status_good,
-                StreamDirection::BtoA => Color::Magenta,
-            };
-            let bytes = seg.decrypted.as_deref().unwrap_or(&seg.payload);
-            // Dim raw (handshake / undecrypted) segments once a decrypted
-            // conversation exists, so the plaintext reads clearly.
-            let text_style = if stream_has_decrypted && seg.decrypted.is_none() {
-                Style::default().fg(app.theme.text_muted)
-            } else {
-                Style::default()
-            };
-            let text: String = bytes
-                .iter()
-                .map(|&b| {
-                    if b.is_ascii_graphic() || b == b' ' || b == b'\t' {
-                        b as char
-                    } else if b == b'\n' || b == b'\r' {
-                        '\n'
-                    } else {
-                        '·'
-                    }
-                })
-                .collect();
-            for text_line in text.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {arrow} "), Style::default().fg(arrow_color)),
-                    Span::styled(text_line.to_string(), text_style),
-                ]));
-            }
-        }
-        lines
-    };
+    // Build the content lines via the shared builder so the renderer and the
+    // `s` open-stream handler agree on layout (the handler uses its returned
+    // focus-line index to scroll to the selected packet).
+    let (content_lines, _focus_first, shown_segments) = build_stream_lines(
+        &stream,
+        app.ui.stream_hex_mode,
+        app.ui.stream_direction_filter,
+        app.ui.stream_view_focus_packet,
+        &app.theme,
+    );
 
     let visible_height = chunks[1].height.saturating_sub(2) as usize;
     let total_lines = content_lines.len();
@@ -1287,7 +1305,7 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
             format!(" {} packets", stream.packet_count),
             Style::default().fg(app.theme.text_primary),
         ),
-        Span::raw(format!(", {} segments", filtered_segments.len())),
+        Span::raw(format!(", {} segments", shown_segments)),
         Span::raw(" │ "),
         Span::styled("A→B: ", Style::default().fg(app.theme.status_good)),
         Span::raw(format_bytes(stream.total_bytes_a_to_b)),
