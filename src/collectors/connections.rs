@@ -387,16 +387,24 @@ fn overlay_ebpf_attribution(
     connections: &mut [Connection],
     ebpf: &crate::ebpf::conn_tracker::EbpfAttributor,
 ) {
+    use netwatch_sdk::ebpf::Protocol;
     for conn in connections {
-        if !conn.protocol.eq_ignore_ascii_case("tcp") {
+        // TCP (`tcp_v{4,6}_connect`) and connected UDP — QUIC etc.
+        // (`ip{4,6}_datagram_connect`) — are both attributed; the cache is
+        // protocol-keyed so the two don't alias on a shared `daddr:dport`.
+        let proto = if conn.protocol.eq_ignore_ascii_case("tcp") {
+            Protocol::Tcp
+        } else if conn.protocol.eq_ignore_ascii_case("udp") {
+            Protocol::Udp
+        } else {
             continue;
-        }
-        // Keyed on the destination only — the kprobes can't see the source
+        };
+        // Keyed on protocol + destination — the kprobes can't see the source
         // at connect-entry (see conn_tracker::AttrKey).
         let (Some(daddr), Some(dport)) = parse_endpoint(&conn.remote_addr) else {
             continue;
         };
-        if let Some(attr) = ebpf.lookup(daddr, dport) {
+        if let Some(attr) = ebpf.lookup(proto, daddr, dport) {
             conn.pid = Some(attr.pid);
             conn.process_name = Some(attr.comm);
             conn.attribution = AttributionSource::Ebpf;

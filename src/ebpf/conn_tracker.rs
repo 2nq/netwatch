@@ -7,13 +7,15 @@
 //! the macOS PKTAP integration, just with a different kernel data source.
 //!
 //! Phase 1 of the SDK's eBPF roadmap covered `tcp_v4_connect`; Phase 2
-//! adds `tcp_v6_connect`, so IPv4 and IPv6 TCP are both attributed (UDP
-//! is still pending). Shared caveat:
-//! - Both kprobes fire at connect-entry, where the destination (from the
+//! adds `tcp_v6_connect` (IPv4 + IPv6 TCP) plus the connected-UDP probes
+//! `ip4_datagram_connect`/`ip6_datagram_connect`, so QUIC and other
+//! `connect()`ed UDP flows are attributed too. *Unconnected* UDP
+//! (`sendto`/`sendmsg`) is still pending. Shared caveat:
+//! - All four kprobes fire at connect-entry, where the destination (from the
 //!   `uaddr` arg) is valid but the socket's own source addr/port aren't yet
 //!   assigned. So `saddr`/`sport` are reported as 0 and we key the cache by
-//!   `(daddr, dport)`, accepting that two concurrent connections to the same
-//!   `daddr:dport` would alias. Rare in practice.
+//!   `(protocol, daddr, dport)`, accepting that two concurrent same-protocol
+//!   connections to the same `daddr:dport` would alias. Rare in practice.
 //!
 //! The SDK canonicalises v4-mapped IPv6 destinations (`::ffff:a.b.c.d`,
 //! i.e. IPv4 traffic on dual-stack sockets) to `IpAddr::V4` before they
@@ -23,7 +25,7 @@
 //! cross-platform builds keep working; `EventSource::new` returns
 //! `EbpfError::UnsupportedPlatform` at runtime there.
 
-use netwatch_sdk::ebpf::{ConnectEvent, EbpfError, EbpfEvent, EventSource};
+use netwatch_sdk::ebpf::{ConnectEvent, EbpfError, EbpfEvent, EventSource, Protocol};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,12 +46,14 @@ pub struct EbpfAttribution {
     pub seen_at: Instant,
 }
 
-/// `(daddr, dport)` — keyed on the destination only. The connect kprobes
-/// fire at connect-entry, before the kernel assigns the socket's source
-/// address, so `saddr` is unavailable (reported as 0); `sport` was never
-/// captured either. Two local processes connecting to the same
-/// `daddr:dport` concurrently would alias — rare in practice.
-type AttrKey = (IpAddr, u16);
+/// `(protocol, daddr, dport)` — keyed on transport plus destination. The
+/// connect kprobes fire at connect-entry, before the kernel assigns the
+/// socket's source address, so `saddr` is unavailable (reported as 0);
+/// `sport` was never captured either. Protocol is part of the key so a TCP
+/// and a (connected) UDP flow to the same `daddr:dport` — e.g. both to
+/// `:443` — don't cross-attribute. Two same-protocol flows to the same
+/// `daddr:dport` concurrently still alias — rare in practice.
+type AttrKey = (Protocol, IpAddr, u16);
 
 /// Shared cache of `AttrKey → EbpfAttribution`. Populated by the background
 /// drain thread, consulted by the connection collector.
@@ -63,8 +67,8 @@ impl EbpfAttributor {
         Arc::new(Self::default())
     }
 
-    pub fn lookup(&self, daddr: IpAddr, dport: u16) -> Option<EbpfAttribution> {
-        self.cache.lock().ok()?.get(&(daddr, dport)).cloned()
+    pub fn lookup(&self, proto: Protocol, daddr: IpAddr, dport: u16) -> Option<EbpfAttribution> {
+        self.cache.lock().ok()?.get(&(proto, daddr, dport)).cloned()
     }
 
     fn record(&self, key: AttrKey, attr: EbpfAttribution) {
@@ -155,7 +159,7 @@ fn record_connect(attributor: &Arc<EbpfAttributor>, evt: ConnectEvent) {
         return;
     }
     attributor.record(
-        (evt.daddr, evt.dport),
+        (evt.protocol, evt.daddr, evt.dport),
         EbpfAttribution {
             // tgid, not pid: connect(2) often fires on a worker thread,
             // and the "PID" userspace tools (and our UI) report is the
@@ -200,7 +204,7 @@ mod live_tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut attr = None;
         while Instant::now() < deadline {
-            if let Some(a) = tracker.attributor.lookup(key, port) {
+            if let Some(a) = tracker.attributor.lookup(Protocol::Tcp, key, port) {
                 attr = Some(a);
                 break;
             }
@@ -214,6 +218,59 @@ mod live_tests {
             attr.pid,
             std::process::id(),
             "cached pid should be the process (tgid), not the connecting thread"
+        );
+    }
+
+    /// Connected-UDP twin of the TCP test: `UdpSocket::connect` to a `[::1]`
+    /// peer must land in the cache under `Protocol::Udp` (the QUIC client
+    /// pattern). Verifies the `ip6_datagram_connect` kprobe and the
+    /// protocol-keyed cache end-to-end. Self-skips without CAP_BPF.
+    #[test]
+    fn udp_v6_connect_lands_in_attribution_cache() {
+        use std::net::UdpSocket;
+
+        let tracker = match ConnTracker::new() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ConnTracker::new failed ({e}); skipping — needs root/CAP_BPF");
+                return;
+            }
+        };
+
+        // A bound peer gives us a fixed destination port to key on; we never
+        // send — `connect()` alone fires ip6_datagram_connect.
+        let peer = UdpSocket::bind("[::1]:0").expect("bind ::1 udp peer");
+        let port = peer.local_addr().unwrap().port();
+        thread::sleep(Duration::from_millis(50));
+        let sock = UdpSocket::bind("[::1]:0").expect("bind ::1 udp sender");
+        sock.connect((Ipv6Addr::LOCALHOST, port))
+            .expect("connect udp to ::1");
+
+        let key = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut attr = None;
+        while Instant::now() < deadline {
+            if let Some(a) = tracker.attributor.lookup(Protocol::Udp, key, port) {
+                attr = Some(a);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let attr = attr.expect("no UDP attribution cached for our ::1 connect within 2s");
+        assert_eq!(
+            attr.pid,
+            std::process::id(),
+            "cached pid should be the process (tgid)"
+        );
+        // The TCP cache must not be populated by a UDP connect — proves the
+        // protocol key actually discriminates.
+        assert!(
+            tracker
+                .attributor
+                .lookup(Protocol::Tcp, key, port)
+                .is_none(),
+            "UDP connect must not alias into the TCP cache slot"
         );
     }
 }
